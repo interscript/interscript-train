@@ -78,6 +78,7 @@ def main() -> None:
             opset_version=14,
             dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
                           "last_hidden_state": {0: "batch", 1: "seq"}},
+            use_external_data_format=False,
         )
         torch.onnx.export(
             DecoderWithHead(model), (torch.tensor([[0]]), hidden), str(dec_p),
@@ -86,6 +87,7 @@ def main() -> None:
             dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
                           "encoder_hidden_states": {0: "batch", 1: "seq"},
                           "logits": {0: "batch", 1: "seq"}},
+            use_external_data_format=False,
         )
     print(f"[export] fp32 {enc_p.stat().st_size/1e6:.0f}MB + {dec_p.stat().st_size/1e6:.0f}MB", flush=True)
 
