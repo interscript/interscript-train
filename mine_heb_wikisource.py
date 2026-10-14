@@ -47,8 +47,18 @@ def api_pages(limit: int = 50):
         "prop": "extracts", "explaintext": 1,
     }
     while True:
-        r = requests.get(API, params=params, headers=UA, timeout=60)
-        r.raise_for_status()
+        for attempt in range(6):
+            r = requests.get(API, params=params, headers=UA, timeout=60)
+            if r.status_code == 429:
+                wait = min(600, 30 * (2 ** attempt))
+                print(f"[429] backing off {wait}s", flush=True)
+                __import__("time").sleep(wait)
+                continue
+            r.raise_for_status()
+            break
+        else:
+            raise SystemExit("rate-limited past backoff")
+        __import__("time").sleep(1.0)
         data = r.json()
         for page in (data.get("query", {}).get("pages", {}) or {}).values():
             if "extract" in page:
