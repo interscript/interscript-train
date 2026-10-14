@@ -107,6 +107,7 @@ def main() -> None:
         return torchaudio.functional.resample(t, orig_sr, target_sr).numpy()
 
     f_lo, f_hi = stretch_factors()
+    smoke = int(os.environ.get("SMOKE_SHARDS", "0"))
     kept_rows, stats = [], {"total": 0, "ratio_dropped": 0,
                             "inconsistent": 0, "kept": 0}
     out_path = OUT / "labels-filtered.jsonl"
@@ -114,7 +115,11 @@ def main() -> None:
     t0 = __import__("time").time()
 
     with out_path.open("w", encoding="utf-8") as out:
-        for si, name in enumerate(sorted(WDS.glob("shard-*.tar"))):
+        shards = sorted(WDS.glob("shard-*.tar"))
+        if smoke:
+            shards = shards[:smoke]
+        for si, name in enumerate(shards):
+            t_shard = __import__("time").time()
             with tarfile.open(name) as tf:
                 members = {m.name: m for m in tf.getmembers()}
                 for m in members.values():
@@ -154,10 +159,9 @@ def main() -> None:
                         stats["kept"] += 1
                     else:
                         stats["inconsistent"] += 1
-            if (si + 1) % 20 == 0:
-                r = stats["total"] / max(1, __import__("time").time() - t0)
-                print(f"[filter] shard {si + 1} total={stats['total']} "
-                      f"kept={stats['kept']} ({r:.0f} rows/s)", flush=True)
+            print(f"[filter] shard {si + 1} done in "
+                  f"{__import__('time').time() - t_shard:.0f}s "
+                  f"total={stats['total']} kept={stats['kept']}", flush=True)
 
     stats["band"] = [round(lo, 3), round(hi, 3)]
     print(json.dumps(stats), flush=True)
