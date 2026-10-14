@@ -109,7 +109,13 @@ def build_labels() -> list[dict]:
 
 def main() -> None:
     CKPT.mkdir(parents=True, exist_ok=True)
-    rows = build_labels()
+    src = os.environ.get("LABELS_SRC")
+    if src:
+        rows = [json.loads(l) for l in Path(src).read_text(
+            encoding="utf-8").splitlines() if l.strip()]
+        print(f"[labels] external source {src}: {len(rows)} rows", flush=True)
+    else:
+        rows = build_labels()
     random.Random(42).shuffle(rows)
     train = rows[: int(len(rows) * 0.98)]
     print(f"[data] pairs={len(rows)} train={len(train)}", flush=True)

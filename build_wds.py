@@ -24,7 +24,7 @@ sys.path.insert(0, "/code/wds-core")
 
 from ivrit_wds_core import build_sample, shard_stats, write_shard  # noqa: E402
 
-OUT = Path("/ckpt/run-050-ivrit-wds")
+OUT = Path("/ckpt") / os.environ.get("S_OUT", "run-050-ivrit-wds")
 OUT.mkdir(parents=True, exist_ok=True)
 TOKEN = os.environ["HF_TOKEN"]
 api = HfApi(token=TOKEN)

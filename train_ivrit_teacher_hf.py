@@ -73,6 +73,10 @@ def load_slice() -> tuple[list[dict], list[dict]]:
                         continue
                     rec = {"uuid": m.name[:-5], **meta,
                            "wav": tf.extractfile(wav_m).read()}
+                    # targets = crown-nikud vocalization (WO31 convention:
+                    # pointed text -> espeak -> vowel-full phonemes)
+                    if rec.get("pointed"):
+                        rec["text"] = rec["pointed"]
                     (train if group == "train" else dev).append(rec)
         if group == "train":
             hours = sum(r["dur"] for r in train) / 3600
@@ -105,6 +109,16 @@ def main() -> None:
         "facebook/wav2vec2-lv-60-espeak-cv-ft").cuda().train()
     model.freeze_feature_encoder()
 
+    # resume from the latest step ckpt if present (silent infra kills);
+    # step dirs are save_pretrained outputs -> load via from_pretrained
+    steps = sorted(CKPT.glob("step-*"), key=lambda p: int(p.name.split("-")[1]))
+    if steps:
+        model = AutoModelForCTC.from_pretrained(steps[-1]).cuda().train()
+        model.freeze_feature_encoder()
+        proc = AutoProcessor.from_pretrained(steps[-1])
+        tok = proc.tokenizer
+        print(f"[resume] {steps[-1].name}", flush=True)
+
     train, dev = load_slice()
 
     unk_total = tok_total = 0
@@ -117,23 +131,24 @@ def main() -> None:
     if unk_rate > 0.05:
         raise SystemExit("pointed text phonemization off-vocab — aborting")
 
+    def pcm_to_16k(r: dict) -> np.ndarray:
+        # shards carry RAW int16 PCM (no RIFF header) + sr in json
+        import torchaudio  # noqa: PLC0415
+
+        t = torch.from_numpy(
+            np.frombuffer(r["wav"], dtype=np.int16).astype(np.float32) / 32768.0)
+        sr = int(r["sr"])
+        if sr != 16000:
+            t = torchaudio.functional.resample(t, sr, 16000)
+        return t.numpy()
+
     class DS(torch.utils.data.Dataset):
         def __len__(self):
             return len(train)
 
         def __getitem__(self, i):
             r = train[i]
-            wav, sr = sf.read(io.BytesIO(r["wav"]), dtype="float32")
-            if sr != 16000:
-                import torchaudio  # noqa: PLC0415
-
-                t = torch.from_numpy(wav)
-                if t.ndim > 1:
-                    t = t.mean(1)
-                wav = torchaudio.functional.resample(t, sr, 16000).numpy()
-            elif wav.ndim > 1:
-                wav = wav.mean(1)
-            return wav.astype(np.float32), r["text"]
+            return pcm_to_16k(r).astype(np.float32), r["text"]
 
     def collate(b):
         feats = proc.feature_extractor([w for w, _ in b], sampling_rate=16000,
@@ -191,14 +206,21 @@ def main() -> None:
     unk = tok.unk_token_id
 
     @torch.no_grad()
-    def asr_phones(wav) -> list[str]:
-        if isinstance(wav, (bytes, bytearray)):
-            wav, sr = sf.read(io.BytesIO(wav), dtype="float32")
-        else:
-            sr = 16000
+    def asr_phones(wav, sr: int = 16000) -> list[str]:
+        if isinstance(wav, dict):  # {wav: raw pcm bytes, sr}
+            sr = int(wav.get("sr", 16000))
+            wav = (np.frombuffer(wav["wav"], dtype=np.int16)
+                   .astype(np.float32) / 32768.0)
+        elif isinstance(wav, (bytes, bytearray)):
+            wav = np.frombuffer(wav, dtype=np.int16).astype(np.float32) / 32768.0
         if wav.ndim > 1:
             wav = wav.mean(1)
-        feats = proc.feature_extractor(wav, sampling_rate=sr,
+        if sr != 16000:
+            import torchaudio  # noqa: PLC0415
+
+            wt = torch.from_numpy(wav)
+            wav = torchaudio.functional.resample(wt, sr, 16000).numpy()
+        feats = proc.feature_extractor(wav, sampling_rate=16000,
                                        return_tensors="pt")
         with torch.autocast("cuda", torch.bfloat16):
             logits = model(feats.input_values.cuda()).logits
@@ -217,7 +239,7 @@ def main() -> None:
                 pers.append(phone_lev(pred, gold) / len(gold))
         return float(np.mean(pers)) if pers else 1.0
 
-    ivrit_pairs = [(asr_phones(r["wav"]),
+    ivrit_pairs = [(asr_phones(r),
                     norm_phones(" ".join(tok.convert_ids_to_tokens(
                         tok(r["text"], add_special_tokens=False).input_ids))))
                    for r in dev[:400]]
@@ -258,7 +280,10 @@ def main() -> None:
 
     verdict = {"run": CKPT.name, "fleurs_dev_per": round(fleurs_per, 4),
                "ivrit_dev_per": round(ivrit_per, 4),
-               "gate": "fleurs_dev_per < 0.25",
+               "note": ("pointed-convention model: FLEURS PER is "
+                        "convention-shifted (skeleton golds); primary "
+                        "gate = ivrit dev, same convention as training"),
+               "gate": "ivrit_dev_per < 0.30 (primary); fleurs reported",
                "baseline_run038": 0.319, "utts_ivrit": len(ivrit_pairs),
                "utts_fleurs": len(fleurs_pairs), "epochs": EPOCHS,
                "slice_hours": round(sum(r["dur"] for r in train) / 3600, 1)}
