@@ -25,6 +25,7 @@ CAP = int(os.environ.get("M_CAP", "100000"))
 VOC_FRAC = float(os.environ.get("VOC_FRAC", "0.55"))
 MIN_LETTERS = int(os.environ.get("MIN_LETTERS", "40"))
 API = "https://he.wikisource.org/w/api.php"
+UA = {"User-Agent": "Interscript-miner/1.0 (https://github.com/interscript; research gold-nikud corpus, CC BY-SA compliance)"}
 
 HEBREW_LETTER = re.compile("[א-ת]")
 NIQQUD = re.compile("[֑-ׇ]")
@@ -46,7 +47,7 @@ def api_pages(limit: int = 50):
         "prop": "extracts", "explaintext": 1,
     }
     while True:
-        r = requests.get(API, params=params, timeout=60)
+        r = requests.get(API, params=params, headers=UA, timeout=60)
         r.raise_for_status()
         data = r.json()
         for page in (data.get("query", {}).get("pages", {}) or {}).values():
