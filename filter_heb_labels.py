@@ -114,6 +114,24 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = __import__("time").time()
 
+    DEC_BS = int(os.environ.get("DEC_BS", "16"))
+
+    @torch.no_grad()
+    def decode_batch(wavs: list[np.ndarray]) -> list[list[str]]:
+        feats = proc.feature_extractor(wavs, sampling_rate=16000,
+                                       return_tensors="pt", padding=True)
+        with torch.autocast("cuda", torch.bfloat16):
+            logits = model(feats.input_values.cuda()).logits
+        out: list[list[str]] = []
+        for row_ids in logits.argmax(-1).tolist():
+            kept, seen = [], None
+            for i in row_ids:
+                if i != unk and i != seen:
+                    kept.append(i)
+                seen = i
+            out.append(norm_phones(tok.decode(kept) if kept else ""))
+        return out
+
     with out_path.open("w", encoding="utf-8") as out:
         shards = sorted(WDS.glob("shard-*.tar"))
         if smoke:
@@ -122,6 +140,8 @@ def main() -> None:
             t_shard = __import__("time").time()
             with tarfile.open(name) as tf:
                 members = {m.name: m for m in tf.getmembers()}
+                # pass 1: collect (row, wav) for ratio-passing rows
+                todo = []
                 for m in members.values():
                     if not m.name.endswith(".json"):
                         continue
@@ -144,21 +164,26 @@ def main() -> None:
                     if wav.ndim > 1:
                         wav = wav.mean(1)
                     w16 = resample(wav, sr, 16000) if sr != 16000 else wav
-                    label_phones = norm_phones(row["ipa"])
-                    ok = True
+                    todo.append((row, w16))
+                # pass 2: batched stretch-decodes
+                for b in range(0, len(todo), DEC_BS):
+                    batch = todo[b:b + DEC_BS]
+                    votes = []
                     for factor in (f_lo, f_hi):
-                        # time-stretch = decode at a shifted rate
-                        stretched = resample(w16, 16000,
-                                             int(16000 / factor))
-                        if not consistent(decode(stretched), label_phones):
-                            ok = False
-                            break
-                    if ok:
-                        kept_rows.append(row)
-                        out.write(json.dumps(row, ensure_ascii=False) + "\n")
-                        stats["kept"] += 1
-                    else:
-                        stats["inconsistent"] += 1
+                        stretched = [resample(w, 16000, int(16000 / factor))
+                                     for _, w in batch]
+                        votes.append(decode_batch(stretched))
+                    for j, (row, _) in enumerate(batch):
+                        label_phones = norm_phones(row["ipa"])
+                        ok = all(consistent(votes[k][j], label_phones)
+                                 for k in (0, 1))
+                        if ok:
+                            kept_rows.append(row)
+                            out.write(json.dumps(row, ensure_ascii=False)
+                                      + "\n")
+                            stats["kept"] += 1
+                        else:
+                            stats["inconsistent"] += 1
             print(f"[filter] shard {si + 1} done in "
                   f"{__import__('time').time() - t_shard:.0f}s "
                   f"total={stats['total']} kept={stats['kept']}", flush=True)
