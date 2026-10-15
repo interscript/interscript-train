@@ -22,7 +22,7 @@ N = int(os.environ.get("PARITY_N", "300"))
 PRECISION = os.environ.get("PARITY_PRECISION", "int8")  # int8 | fp32
 CKPT = Path("/ckpt") / RUN / "best"
 EXPORT = Path("/ckpt") / RUN / "export"
-DATA = Path("/data-ru/data/test.jsonl")
+DATA = Path(os.environ.get("PARITY_DATA", "/data-ru/data/test.jsonl"))
 MAXLEN = 256
 
 
@@ -92,7 +92,7 @@ ENC_IN = es.get_inputs()[0].name
 DEC_IN = [i.name for i in ds.get_inputs()]
 print(f"[onnx] encoder input: {ENC_IN}; decoder inputs: {DEC_IN}", flush=True)
 onnx_preds = []
-BS = 16
+BS = int(os.environ.get('PARITY_BS', '8'))
 with torch.no_grad():
     for i in range(0, len(srcs), BS):
         batch = srcs[i:i+BS]
