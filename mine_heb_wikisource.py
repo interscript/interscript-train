@@ -40,10 +40,13 @@ from mine_heb_vocalized import paragraph_vocalized  # noqa: E402
 
 
 def api_pages(limit: int = 50):
-    """All content pages, continue-token pagination."""
+    """Category-members crawl (dense vocalized namespaces)."""
     params = {
         "action": "query", "format": "json",
-        "generator": "allpages", "gaplimit": limit,
+        "generator": "categorymembers",
+        "gcmtitle": os.environ.get(
+            "WS_CATEGORY", 'קטגוריה:פרקי התנ"ך'),
+        "gcmlimit": limit, "gcmsort": "name",
         "prop": "extracts", "explaintext": 1,
     }
     while True:
