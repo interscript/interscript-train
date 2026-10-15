@@ -156,16 +156,10 @@ def main() -> None:
 
     preds: dict[str, list[str]] = {}
     for name, ckpt, bs in ARMS:
-        out = CKPT / f"preds-{name}.jsonl"
-        if out.exists() and out.stat().st_size > 0:
-            preds[name] = [json.loads(l)["pred"] for l in
-                           out.read_text(encoding="utf-8").splitlines()]
-            print(f"[{name}] resumed {len(preds[name])}", flush=True)
-            continue
+        # always call decode_arm: it resumes at the synced line count
+        # internally and appends the remainder (a file-exists skip here
+        # silently shipped partial arms into the consolidation)
         preds[name] = decode_arm(name, ckpt, bs, srcs)
-        with out.open("w", encoding="utf-8") as f:
-            for p in preds[name]:
-                f.write(json.dumps({"pred": p}, ensure_ascii=False) + "\n")
 
     with (CKPT / "arm-preds.jsonl").open("w", encoding="utf-8") as f, \
          (CKPT / "oracle-targets.jsonl").open("w", encoding="utf-8") as g:
