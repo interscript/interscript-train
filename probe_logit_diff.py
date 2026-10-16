@@ -92,3 +92,8 @@ for ri, row in enumerate(rows):
                                    for c in pred),
         "pred_head": pred[:50],
     }, ensure_ascii=False), flush=True)
+
+# NEXT-SESSION NOTE: run this as an HF job (l4x1, 30 min) with
+# MODEL pointed at /ckpt/run-066-urd-diac-base/best (HF torch model)
+# instead of the local onnx-only dir — the local run lacks the
+# torch weights. The ORT half is unchanged.
