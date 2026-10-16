@@ -140,10 +140,32 @@ def decode_arm(name: str, ckpt: str, bs: int, srcs: list[str]) -> list[str]:
                 for p in tok.batch_decode(gen, skip_special_tokens=True):
                     f.write(json.dumps({"pred": p}, ensure_ascii=False) + "\n")
                 f.flush()
+                # container death loses appends (3 resume passes lost
+                # ~30 GPU-h this way) — force a durable bucket upload
+                # every ~4k decoded rows
+                if (i // bs) % 125 == 0:
+                    try:
+                        from huggingface_hub import HfApi
+                        HfApi(token=os.environ["HF_TOKEN"]).upload_file(
+                            path_or_fileobj=str(out),
+                            path_in_repo=str(out.relative_to(Path("/ckpt"))),
+                            repo_id="Interscript/isx-training",
+                            repo_type="bucket")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[{name}] sync failed: {e}", flush=True)
                 if (i // bs) % 50 == 0:
                     r = (i + bs - done) / max(1, time.time() - t0)
                     print(f"[{name}] {i + bs - done}/{len(srcs) - done} "
                           f"({r:.0f} rows/s)", flush=True)
+    try:
+        from huggingface_hub import HfApi
+        HfApi(token=os.environ["HF_TOKEN"]).upload_file(
+            path_or_fileobj=str(out),
+            path_in_repo=str(out.relative_to(Path("/ckpt"))),
+            repo_id="Interscript/isx-training",
+            repo_type="bucket")
+    except Exception as e:  # noqa: BLE001
+        print(f"[{name}] final sync failed: {e}", flush=True)
     return [json.loads(l)["pred"] for l in
             out.read_text(encoding="utf-8").splitlines()]
 
