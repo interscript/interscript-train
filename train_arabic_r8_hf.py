@@ -40,6 +40,7 @@ DATA = Path("/train_data")
 TEACHER = Path("/ckpt/r7-best")
 import os
 MIX = os.environ.get("R8_MIX", "arwiki")  # arwiki | qcri | both
+STRIP_ALT = os.environ.get("R8_STRIP_ALT") == "1"
 BACKBONE = os.environ.get("R8_BACKBONE", "google/byt5-base")
 CORPUS = os.environ.get("R8_CORPUS", "tashkeela")  # tashkeela | r5
 RUN = os.environ.get("R8_RUN", f"run-024-arabic-r8-{MIX}")
@@ -199,6 +200,17 @@ def main() -> None:
     print(f"[data] pseudo={len(pseudo)} (mix={MIX})", flush=True)
 
     units = gold + pseudo
+    if STRIP_ALT:
+        # WO35: the corpus's multi-reference format is decode noise —
+        # train the primary reading as the whole job
+        stripped = []
+        for _src, tgt in units:
+            tgt2 = " ".join(t.split("/", 1)[0] for t in tgt.split())
+            src2 = DIACRITICS_RE.sub("", tgt2).strip()
+            if len(src2) >= 5:
+                stripped.append((src2, tgt2))
+        units = stripped
+        print(f"[data] strip-alt units={len(units)}", flush=True)
     rng.shuffle(units)
     rng.shuffle(gold)
 
@@ -368,13 +380,22 @@ def main() -> None:
     k = 0
     wparas = []
     for text, c in zip(winputs, wcounts):
-        wparas.append(" ".join(wpreds[k:k + c]))
+        stitched = " ".join(wpreds[k:k + c])
+        wparas.append(project_haraqat(stitched, text))
         k += c
     wscore = WN.score(wparas, bench, skip_last=False)
     print(json.dumps({"run": RUN, "surface": "wikinews-2024-multiref", **wscore},
                      ensure_ascii=False), flush=True)
     (CKPT / "wikinews_multiref.json").write_text(
         json.dumps({"run": RUN, **wscore}, ensure_ascii=False, indent=1))
+    # WO35 corrected protocol: primary-choice decode
+    fa = [" ".join(w.split("/", 1)[0] for w in p.split()) for p in wparas]
+    (CKPT / "wikinews_preds.txt").write_text("\n".join(fa) + "\n", encoding="utf-8")
+    fascore = WN.score(fa, bench, skip_last=False)
+    print(json.dumps({"run": RUN, "surface": "wikinews-2024-multiref-firstalt",
+                      **fascore}, ensure_ascii=False), flush=True)
+    (CKPT / "wikinews_multiref_firstalt.json").write_text(
+        json.dumps({"run": RUN, **fascore}, ensure_ascii=False, indent=1))
     (CKPT / "EVAL_DONE").touch()
 
 

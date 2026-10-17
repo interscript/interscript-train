@@ -41,6 +41,21 @@ RUN = os.environ.get("R8_RUN", "run-024-arabic-r8-qcri")
 IMF_ID = os.environ.get("IMF_ID", "ara-diac-news-1.0")
 METRIC_DER = os.environ.get("IMF_METRIC_DER", "")
 METRIC_WER = os.environ.get("IMF_METRIC_WER_WN", "")
+METRIC_CER = os.environ.get("IMF_METRIC_CER", "")
+METRIC_CER_NORM = os.environ.get("IMF_METRIC_CER_NORM", "")
+TASK = os.environ.get("IMF_TASK", "diacritization")
+SOURCE = os.environ.get("IMF_SOURCE", "Arab")
+TARGET = os.environ.get("IMF_TARGET", "Arab")
+TRAINED_FROM = os.environ.get("IMF_TRAINED_FROM",
+                              "r7-init noisy-student, run {RUN} (TODO.sota WO17)")
+# WO44: dynamic int8 quantization destroyed seq2seq decode quality
+# (urd parity 0.44 vs 0.16 fp32 CER) — artifacts ship FP32 by default.
+PRECISION = os.environ.get("EXPORT_PRECISION", "fp32")
+# byt5-LARGE fp32 graphs exceed the 2GB protobuf boundary — torch emits
+# external-data files no matter the pin, and the zip would ship a stub.
+# fp16 halves each graph below the boundary (gate numbers were measured
+# under bf16 autocast, so fp16 is the faithful tier).
+EXPORT_DTYPE = os.environ.get("EXPORT_DTYPE", "fp32")
 CKPT = Path("/ckpt") / RUN / "best"
 OUT_DIR = Path("/ckpt") / RUN / "export"
 
@@ -64,7 +79,8 @@ def sha256_bytes(b: bytes) -> str:
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    model = AutoModelForSeq2SeqLM.from_pretrained(CKPT).eval()
+    _dt = {"fp32": torch.float32, "fp16": torch.float16}[EXPORT_DTYPE]
+    model = AutoModelForSeq2SeqLM.from_pretrained(CKPT, torch_dtype=_dt).eval()
     ids = torch.tensor([[104, 101]])
     with torch.no_grad():
         hidden = model.get_encoder()(input_ids=ids)[0]
@@ -78,6 +94,7 @@ def main() -> None:
             opset_version=14,
             dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
                           "last_hidden_state": {0: "batch", 1: "seq"}},
+            use_external_data_format=False,
         )
         torch.onnx.export(
             DecoderWithHead(model), (torch.tensor([[0]]), hidden), str(dec_p),
@@ -86,24 +103,46 @@ def main() -> None:
             dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
                           "encoder_hidden_states": {0: "batch", 1: "seq"},
                           "logits": {0: "batch", 1: "seq"}},
+            use_external_data_format=False,
         )
+    # torch emits external-data files for large graphs even with the pin;
+    # re-fuse into single-file protobufs (fp16 graphs fit under 2GB)
+    import onnx
+
+    for graph_p in (enc_p, dec_p):
+        m = onnx.load(str(graph_p), load_external_data=True)
+        onnx.save(m, str(graph_p))
+        print(f"[refuse] {graph_p.name} -> "
+              f"{graph_p.stat().st_size/1e6:.0f}MB single-file", flush=True)
     print(f"[export] fp32 {enc_p.stat().st_size/1e6:.0f}MB + {dec_p.stat().st_size/1e6:.0f}MB", flush=True)
 
-    from onnxruntime.quantization import QuantType, quantize_dynamic
+    if PRECISION == "int8":
+        from onnxruntime.quantization import QuantType, quantize_dynamic
 
-    enc_q, dec_q = OUT_DIR / "encoder.onnx", OUT_DIR / "decoder.onnx"
-    quantize_dynamic(str(enc_p), str(enc_q), weight_type=QuantType.QInt8)
-    quantize_dynamic(str(dec_p), str(dec_q), weight_type=QuantType.QInt8)
-    enc_b = enc_q.read_bytes()
-    dec_b = dec_q.read_bytes()
-    print(f"[export] int8 {len(enc_b)/1e6:.0f}MB + {len(dec_b)/1e6:.0f}MB", flush=True)
+        enc_q, dec_q = OUT_DIR / "encoder.onnx", OUT_DIR / "decoder.onnx"
+        quantize_dynamic(str(enc_p), str(enc_q), weight_type=QuantType.QInt8)
+        quantize_dynamic(str(dec_p), str(dec_q), weight_type=QuantType.QInt8)
+        enc_b, dec_b = enc_q.read_bytes(), dec_q.read_bytes()
+        shipped = "int8"
+        print(f"[export] int8 {len(enc_b)/1e6:.0f}MB + {len(dec_b)/1e6:.0f}MB", flush=True)
+    else:
+        enc_b, dec_b = enc_p.read_bytes(), dec_p.read_bytes()
+        shipped = "fp32"
+        print(f"[export] shipping fp32 {len(enc_b)/1e6:.0f}MB + {len(dec_b)/1e6:.0f}MB", flush=True)
 
-    # sanity: single greedy step on CPU ORT
+    # sanity: single greedy step on CPU ORT, over the SHIPPED bytes
+    import tempfile
+
     import numpy as np
     import onnxruntime as ort
 
-    es = ort.InferenceSession(str(enc_q), providers=["CPUExecutionProvider"])
-    ds = ort.InferenceSession(str(dec_q), providers=["CPUExecutionProvider"])
+    _sd = tempfile.mkdtemp()
+    (Path(_sd) / "encoder.onnx").write_bytes(enc_b)
+    (Path(_sd) / "decoder.onnx").write_bytes(dec_b)
+    es = ort.InferenceSession(str(Path(_sd) / "encoder.onnx"),
+                              providers=["CPUExecutionProvider"])
+    ds = ort.InferenceSession(str(Path(_sd) / "decoder.onnx"),
+                              providers=["CPUExecutionProvider"])
     h = es.run(None, {"input_ids": np.array([[104, 101]], dtype=np.int64)})[0]
     lg = ds.run(None, {"input_ids": np.array([[0]], dtype=np.int64),
                        "encoder_hidden_states": h})[0]
@@ -116,13 +155,19 @@ def main() -> None:
     if METRIC_WER:
         metrics.append({"name": "wer_wikinews2024_multiref", "value": float(METRIC_WER),
                         "source": f"interscript/interscript-models RESULTS {RUN}"})
+    if METRIC_CER:
+        metrics.append({"name": "cer", "value": float(METRIC_CER),
+                        "source": f"interscript/interscript-models RESULTS {RUN}"})
+    if METRIC_CER_NORM:
+        metrics.append({"name": "cer_normalized", "value": float(METRIC_CER_NORM),
+                        "source": f"interscript/interscript-models RESULTS {RUN}"})
 
     meta = {
-        "format": "imf-v1", "id": IMF_ID, "task": "diacritization",
-        "source_script": "Arab", "target": "Arab",
+        "format": "imf-v1", "id": IMF_ID, "task": TASK,
+        "source_script": SOURCE, "target": TARGET,
         "tokenizer": "bytes", "opset": 14, "decoder": "plain",
-        "precision": "int8", "license": "BSD-3-Clause",
-        "trained_from": f"r7-init noisy-student, run {RUN} (TODO.sota WO17)",
+        "precision": shipped if EXPORT_DTYPE == "fp32" else EXPORT_DTYPE, "license": "BSD-3-Clause",
+        "trained_from": TRAINED_FROM.replace("{RUN}", RUN),
         "metrics": metrics,
         "sha256": {"encoder.onnx": sha256_bytes(enc_b),
                    "decoder.onnx": sha256_bytes(dec_b)},
