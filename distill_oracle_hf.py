@@ -150,7 +150,7 @@ def decode_arm(name: str, ckpt: str, bs: int, srcs: list[str]) -> list[str]:
                             path_or_fileobj=str(out),
                             path_in_repo=str(out.relative_to(Path("/ckpt"))),
                             repo_id="Interscript/isx-training",
-                            repo_type="bucket")
+                            repo_type=None)
                     except Exception as e:  # noqa: BLE001
                         print(f"[{name}] sync failed: {e}", flush=True)
                 if (i // bs) % 50 == 0:
@@ -163,7 +163,7 @@ def decode_arm(name: str, ckpt: str, bs: int, srcs: list[str]) -> list[str]:
             path_or_fileobj=str(out),
             path_in_repo=str(out.relative_to(Path("/ckpt"))),
             repo_id="Interscript/isx-training",
-            repo_type="bucket")
+            repo_type=None)
     except Exception as e:  # noqa: BLE001
         print(f"[{name}] final sync failed: {e}", flush=True)
     return [json.loads(l)["pred"] for l in
