@@ -137,6 +137,57 @@ def main() -> None:
               f"{graph_p.stat().st_size/1e6:.0f}MB single-file", flush=True)
     print(f"[export] fp32 {enc_p.stat().st_size/1e6:.0f}MB + {dec_p.stat().st_size/1e6:.0f}MB", flush=True)
 
+    if EXPORT_DTYPE == "fp16":
+        # WO79/WO83: raw-fp16 graph IO is unportable (ruby has no Float16,
+        # node ORT corrupts the boundary) — weights stay fp16, the graph
+        # boundary is always fp32.
+        from onnx import TensorProto, helper
+
+        def _dims(t):
+            return [d.dim_value if d.HasField("dim_value") else d.dim_param
+                    for d in t.shape.dim]
+
+        def widen_outputs(m):
+            g = m.graph
+            for out in list(g.output):
+                t = out.type.tensor_type
+                if t.elem_type != TensorProto.FLOAT16:
+                    continue
+                orig, raw = out.name, out.name + "__raw"
+                out.name = raw
+                for n in g.node:
+                    for i, x in enumerate(n.output):
+                        if x == orig:
+                            n.output[i] = raw
+                g.node.append(helper.make_node(
+                    "Cast", [raw], [orig], to=TensorProto.FLOAT))
+                g.output.append(helper.make_tensor_value_info(
+                    orig, TensorProto.FLOAT, _dims(t)))
+                g.output.remove(out)
+
+        def narrow_input(m, name):
+            g = m.graph
+            inp = next((i for i in g.input if i.name == name), None)
+            if inp is None or inp.type.tensor_type.elem_type != TensorProto.FLOAT16:
+                return
+            internal = name + "__f16"
+            inp.type.tensor_type.elem_type = TensorProto.FLOAT
+            for n in g.node:
+                for i, x in enumerate(n.input):
+                    if x == name:
+                        n.input[i] = internal
+            g.node.insert(0, helper.make_node(
+                "Cast", [name], [internal], to=TensorProto.FLOAT16))
+
+        for graph_p in (enc_p, dec_p):
+            m = onnx.load(str(graph_p))
+            widen_outputs(m)
+            onnx.save(m, str(graph_p))
+        dm = onnx.load(str(dec_p))
+        narrow_input(dm, "encoder_hidden_states")
+        onnx.save(dm, str(dec_p))
+        print("[io] fp16 weights kept; graph boundary normalized to fp32 (WO79)", flush=True)
+
     if PRECISION == "int8":
         from onnxruntime.quantization import QuantType, quantize_dynamic
 
