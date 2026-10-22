@@ -51,14 +51,21 @@ def split_windows(text: str, budget: int = WINDOW) -> list[str]:
     return wins
 
 
-def lev(a: str, b: str) -> int:
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
+try:
+    from Levenshtein import distance as _lev_c
+
+    def lev(a: str, b: str) -> int:
+        return _lev_c(a, b)
+except ImportError:  # pure-python fallback; jobs pip-install the C wheel
+    def lev(a: str, b: str) -> int:
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                               prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1]
 
 
 def build_rows() -> list[tuple[str, str]]:
@@ -105,6 +112,23 @@ def build_rows() -> list[tuple[str, str]]:
     return rows
 
 
+def sync_to_bucket(path: Path) -> None:
+    """Durable sync to the isx-training bucket + existence verify.
+
+    HfApi.upload_file(repo_type=None) 404s on the job's hub version
+    (it hits /api/models/) — HfFileSystem with a buckets/ path is the
+    method that actually works.
+    """
+    from huggingface_hub import HfFileSystem
+
+    fs = HfFileSystem(token=os.environ.get("HF_TOKEN"))
+    dst = f"buckets/Interscript/isx-training/{path.relative_to(Path('/ckpt'))}"
+    with open(path, "rb") as f, fs.open(dst, "wb") as g:
+        g.write(f.read())
+    if not fs.exists(dst):
+        raise RuntimeError(f"sync verify failed: {dst}")
+
+
 def completed_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -145,12 +169,7 @@ def decode_arm(name: str, ckpt: str, bs: int, srcs: list[str]) -> list[str]:
                 # every ~4k decoded rows
                 if (i // bs) % 125 == 0:
                     try:
-                        from huggingface_hub import HfApi
-                        HfApi(token=os.environ["HF_TOKEN"]).upload_file(
-                            path_or_fileobj=str(out),
-                            path_in_repo=str(out.relative_to(Path("/ckpt"))),
-                            repo_id="Interscript/isx-training",
-                            repo_type=None)
+                        sync_to_bucket(out)
                     except Exception as e:  # noqa: BLE001
                         print(f"[{name}] sync failed: {e}", flush=True)
                 if (i // bs) % 50 == 0:
@@ -158,12 +177,7 @@ def decode_arm(name: str, ckpt: str, bs: int, srcs: list[str]) -> list[str]:
                     print(f"[{name}] {i + bs - done}/{len(srcs) - done} "
                           f"({r:.0f} rows/s)", flush=True)
     try:
-        from huggingface_hub import HfApi
-        HfApi(token=os.environ["HF_TOKEN"]).upload_file(
-            path_or_fileobj=str(out),
-            path_in_repo=str(out.relative_to(Path("/ckpt"))),
-            repo_id="Interscript/isx-training",
-            repo_type=None)
+        sync_to_bucket(out)
     except Exception as e:  # noqa: BLE001
         print(f"[{name}] final sync failed: {e}", flush=True)
     return [json.loads(l)["pred"] for l in

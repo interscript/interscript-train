@@ -23,7 +23,7 @@ PRECISION = os.environ.get("PARITY_PRECISION", "int8")  # int8 | fp32
 CKPT = Path("/ckpt") / RUN / "best"
 EXPORT = Path("/ckpt") / RUN / "export"
 DATA = Path(os.environ.get("PARITY_DATA", "/data-ru/data/test.jsonl"))
-MAXLEN = 256
+MAXLEN = int(os.environ.get("PARITY_MAXLEN", "512"))
 
 
 def lev(a: str, b: str) -> int:
@@ -58,7 +58,9 @@ with torch.no_grad():
         enc = tok(srcs[i:i+16], return_tensors="pt", padding=True,
                   truncation=True, max_length=MAXLEN).to("cuda")
         with torch.autocast("cuda", torch.bfloat16):
-            gen = model.generate(**enc, max_new_tokens=MAXLEN, num_beams=1)
+            gen = model.generate(**enc, max_new_tokens=MAXLEN, num_beams=1,
+                                 repetition_penalty=float(os.environ.get("PARITY_REP_PENALTY", "1.0")),
+                                 no_repeat_ngram_size=int(os.environ.get("PARITY_NO_REPEAT_NGRAM", "0")))
         torch_preds.extend(tok.batch_decode(gen, skip_special_tokens=True))
 torch_cer = cer_of(torch_preds)
 print(f"[torch] cer={torch_cer:.4f}", flush=True)
@@ -110,10 +112,19 @@ with torch.no_grad():
         for _ in range(MAXLEN):
             lg = ds.run(None, {DEC_IN[0]: cur, DEC_IN[1]: h})[0]
             nxt = lg[:, -1, :].argmax(-1)
+            ngram = int(os.environ.get("PARITY_NO_REPEAT_NGRAM", "0"))
             for j in range(len(batch)):
                 if done[j]:
                     continue
                 t = int(nxt[j])
+                if ngram and len(seqs[j]) >= ngram - 1:
+                    prefix = tuple(seqs[j][-(ngram - 1):])
+                    seen = {tuple(seqs[j][k:k + ngram])
+                            for k in range(len(seqs[j]) - ngram + 1)}
+                    if (prefix + (t,)) in seen:
+                        blocked = lg[j, -1, :].copy()
+                        blocked[t] = np.float32("-inf")
+                        t = int(blocked.argmax(-1))
                 if t == EOS:
                     done[j] = True
                 else:

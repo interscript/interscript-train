@@ -13,6 +13,7 @@ Usage: python probe_logit_diff.py [n_rows=5]
 from __future__ import annotations
 
 import json
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -21,12 +22,12 @@ import numpy as np
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-ZIP = Path("/tmp/urd-diac-rt/urd-diac-base-1.0.zip")
-TEST = Path("/tmp/fas-data/test.jsonl")
+ZIP = Path(os.environ.get("PROBE_ZIP", "/tmp/urd-diac-rt/urd-diac-base-1.0.zip"))
+TEST = Path(os.environ.get("PROBE_TEST", "/tmp/fas-data/test.jsonl"))
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 5
 
-tmp = Path("/tmp/urd-diac-rt/x")
-tmp.mkdir(exist_ok=True)
+tmp = Path(os.environ.get("PROBE_TMP", "/tmp/urd-diac-rt/x"))
+tmp.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(ZIP) as z:
     for name in ("encoder.onnx", "decoder.onnx"):
         (tmp / name).write_bytes(z.read(name))
@@ -34,8 +35,7 @@ with zipfile.ZipFile(ZIP) as z:
 rows = [json.loads(l) for l in TEST.read_text(
     encoding="utf-8").splitlines() if l.strip()][:N]
 
-tok = AutoTokenizer.from_pretrained(
-    "/tmp/urd-diac-rt", use_fast=False) if (tmp / "tokenizer_config.json").exists() else None
+# tokenizer loads with the model below
 
 import onnxruntime as ort
 
@@ -45,14 +45,9 @@ ds = ort.InferenceSession(str(tmp / "decoder.onnx"),
                           providers=["CPUExecutionProvider"])
 
 model = AutoModelForSeq2SeqLM.from_pretrained(
-    "/tmp/urd-diac-rt", from_tf=False).eval()
-# the HF save needs tokenizer files — copy from the zip's sibling best/
-for f in ("tokenizer_config.json", "special_tokens_map.json",
-          "added_tokens.json"):
-    src = Path("/tmp/fas-83601/checkpoint-83601") / f
-    if src.exists() and not (tmp / f).exists():
-        (tmp / f).write_bytes(src.read_bytes())
-tok = AutoTokenizer.from_pretrained(str(tmp))
+    os.environ.get("PROBE_MODEL", "/ckpt/run-066-urd-diac-base/best")).eval()
+tok = AutoTokenizer.from_pretrained(
+    os.environ.get("PROBE_MODEL", "/ckpt/run-066-urd-diac-base/best"))
 
 for ri, row in enumerate(rows):
     src = row["src"]
@@ -79,7 +74,7 @@ for ri, row in enumerate(rows):
         if t_t != t_o and first_div is None:
             first_div = (step, t_t, t_o, gap)
         dec_out.append(t_o)
-        cur_t = torch.cat([cur_t, [[t_t]]], 1)
+        cur_t = torch.cat([cur_t, torch.tensor([[t_t]])], 1)
         cur_o = np.concatenate([cur_o, [[t_o]]], 1)
         if t_o == 1 and t_t == 1:
             break

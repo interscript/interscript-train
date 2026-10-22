@@ -80,22 +80,42 @@ def sha256_bytes(b: bytes) -> str:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     _dt = {"fp32": torch.float32, "fp16": torch.float16}[EXPORT_DTYPE]
+    MASKED = os.environ.get("EXPORT_ATTENTION_MASK", "") == "1"
     model = AutoModelForSeq2SeqLM.from_pretrained(CKPT, torch_dtype=_dt).eval()
     ids = torch.tensor([[104, 101]])
+    mask = torch.ones_like(ids)
     with torch.no_grad():
-        hidden = model.get_encoder()(input_ids=ids)[0]
+        if MASKED:
+            hidden = model.get_encoder()(input_ids=ids, attention_mask=mask)[0]
+        else:
+            hidden = model.get_encoder()(input_ids=ids)[0]
 
     enc_p, dec_p = OUT_DIR / "encoder-fp32.onnx", OUT_DIR / "decoder-fp32.onnx"
     with torch.no_grad():
-        torch.onnx.export(
-            model.get_encoder(), (ids,), str(enc_p),
-            input_names=["input_ids"],
-            output_names=["last_hidden_state"],
-            opset_version=14,
-            dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
-                          "last_hidden_state": {0: "batch", 1: "seq"}},
-            use_external_data_format=False,
-        )
+        if MASKED:
+            # WO51 remedy (b): the encoder takes attention_mask, so
+            # batched padded decode is faithful; gated by a batched
+            # parity probe before any release (parity.mode batched-mask)
+            torch.onnx.export(
+                model.get_encoder(), (ids, mask), str(enc_p),
+                input_names=["input_ids", "attention_mask"],
+                output_names=["last_hidden_state"],
+                opset_version=14,
+                dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
+                              "attention_mask": {0: "batch", 1: "seq"},
+                              "last_hidden_state": {0: "batch", 1: "seq"}},
+                use_external_data_format=False,
+            )
+        else:
+            torch.onnx.export(
+                model.get_encoder(), (ids,), str(enc_p),
+                input_names=["input_ids"],
+                output_names=["last_hidden_state"],
+                opset_version=14,
+                dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
+                              "last_hidden_state": {0: "batch", 1: "seq"}},
+                use_external_data_format=False,
+            )
         torch.onnx.export(
             DecoderWithHead(model), (torch.tensor([[0]]), hidden), str(dec_p),
             input_names=["input_ids", "encoder_hidden_states"],
@@ -105,6 +125,7 @@ def main() -> None:
                           "logits": {0: "batch", 1: "seq"}},
             use_external_data_format=False,
         )
+    print(f"[export] attention_mask={MASKED}", flush=True)
     # torch emits external-data files for large graphs even with the pin;
     # re-fuse into single-file protobufs (fp16 graphs fit under 2GB)
     import onnx
@@ -143,7 +164,11 @@ def main() -> None:
                               providers=["CPUExecutionProvider"])
     ds = ort.InferenceSession(str(Path(_sd) / "decoder.onnx"),
                               providers=["CPUExecutionProvider"])
-    h = es.run(None, {"input_ids": np.array([[104, 101]], dtype=np.int64)})[0]
+    if MASKED:
+        h = es.run(None, {"input_ids": np.array([[104, 101]], dtype=np.int64),
+                          "attention_mask": np.ones((1, 2), dtype=np.int64)})[0]
+    else:
+        h = es.run(None, {"input_ids": np.array([[104, 101]], dtype=np.int64)})[0]
     lg = ds.run(None, {"input_ids": np.array([[0]], dtype=np.int64),
                        "encoder_hidden_states": h})[0]
     print(f"[sanity] logits shape {lg.shape}", flush=True)

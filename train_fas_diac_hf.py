@@ -26,7 +26,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-DATA = Path("/ckpt") / os.environ.get("U_RUN", "run-076-fas-diac-retrain")
+DATA = Path("/ckpt") / os.environ.get("U_DATA",
+                                      os.environ.get("U_RUN", "run-076-fas-diac-retrain"))
 CKPT = Path("/ckpt") / os.environ.get("U_RUN", "run-066-urd-diac-base")
 BACKBONE = os.environ.get("U_BACKBONE", "google/byt5-small")
 EPOCHS = int(os.environ.get("U_EPOCHS", "3"))
@@ -103,8 +104,16 @@ def main() -> None:
     loader = DataLoader(DS(), batch_size=BS, shuffle=True, collate_fn=collate,
                         num_workers=2, drop_last=True)
     total_steps = (len(loader) // ACCUM) * EPOCHS
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-    sched = get_cosine_schedule_with_warmup(opt, 200, total_steps)
+    lr = float(os.environ.get("U_LR", "3e-4"))
+    wd = float(os.environ.get("U_WD", "0.01"))
+    warmup = int(os.environ.get("U_WARMUP", "200"))
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    if os.environ.get("U_SCHED", "cosine") == "linear":
+        from transformers import get_linear_schedule_with_warmup
+
+        sched = get_linear_schedule_with_warmup(opt, warmup, total_steps)
+    else:
+        sched = get_cosine_schedule_with_warmup(opt, warmup, total_steps)
 
     step = start_ep * (len(loader) // ACCUM)
     t0 = time.time()
