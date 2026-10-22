@@ -23,7 +23,8 @@ def main() -> None:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     from sadeedbench.scoring import score_predictions
 
-    eps = sorted(CKPT.glob("eps*"))
+    eps = sorted((p for p in CKPT.glob("oepoch-*")
+                  if p.is_dir()), key=lambda p: int(p.name.split("-")[1]))
     init = eps[-1] if eps else CKPT / "best"
     print(f"[eval] checkpoint: {init}", flush=True)
 
