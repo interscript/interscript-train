@@ -40,8 +40,9 @@ MAXLEN = 256
 def load(name: str) -> list[tuple[str, str]]:
     rows = [json.loads(l) for l in (DATA / name).read_text(
         encoding="utf-8").splitlines() if l.strip()]
-    return [(r["word"].strip(), r["ipa"].strip().strip("/")) for r in rows
-            if r.get("word", "").strip() and r.get("ipa", "").strip()]
+    return [(r["word"].strip(), (r.get("ipa") or "").strip().strip("/"))
+            for r in rows
+            if (r.get("word") or "").strip() and (r.get("ipa") or "").strip()]
 
 
 class Pairs(Dataset):
