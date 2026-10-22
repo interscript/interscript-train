@@ -12,13 +12,14 @@ Usage (a100-large or gpu, isx-training mounted):
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import torch
 from huggingface_hub import HfApi
 
-DATA = Path("/ckpt") / "run-080-thai-lexicon"
-CKPT = Path("/ckpt") / "run-080-thai-lex"
+DATA = Path("/ckpt") / os.environ.get("E_DATA", "run-080-thai-lexicon")
+CKPT = Path("/ckpt") / os.environ.get("E_CKPT", "run-080-thai-lex")
 
 
 def load(name: str) -> list[tuple[str, str]]:
