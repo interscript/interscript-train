@@ -28,7 +28,9 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-DATA = Path("/ckpt") / "run-080-thai-lexicon"
+DATA = Path("/ckpt") / os.environ.get("T_DATA", "run-080-thai-lexicon")
+TRAIN_FILE = os.environ.get("T_TRAIN", "tha-phonemic-train.jsonl")
+DEV_FILE = os.environ.get("T_DEV", "tha-phonemic-test.jsonl")
 CKPT = Path("/ckpt") / os.environ.get("T_RUN", "run-080-thai-lex")
 BACKBONE = os.environ.get("T_BACKBONE", "google/byt5-small")
 EPOCHS = int(os.environ.get("T_EPOCHS", "8"))
@@ -100,8 +102,8 @@ def main() -> None:
                               get_cosine_schedule_with_warmup)
 
     tok = AutoTokenizer.from_pretrained(BACKBONE)
-    train = load("tha-phonemic-train.jsonl")
-    dev = load("tha-phonemic-test.jsonl")
+    train = load(TRAIN_FILE)
+    dev = load(DEV_FILE)
     print(f"[data] train={len(train)} dev={len(dev)}", flush=True)
 
     eps = sorted(CKPT.glob("oepoch-*"),
