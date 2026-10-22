@@ -59,17 +59,23 @@ def main() -> None:
     vocab = [w for w, c in freq.most_common(MAX_TYPES) if c >= MIN_FREQ]
     print(f"[wiki] vocab after freq>={MIN_FREQ}: {len(vocab)}", flush=True)
 
-    both, royin_only, defects = [], [], 0
+    both, royin_only, defects, tltk_fail = [], [], 0, 0
     for w in vocab:
         try:
             ph = transliterate(w, engine="royin").strip()
-            ipa = tltk.th2ipa(w).strip()
         except Exception:
             defects += 1
             continue
         if not ph or defect(ph):
             defects += 1
             continue
+        ipa = ""
+        try:
+            ipa = tltk.th2ipa(w).strip()
+        except Exception as e:  # engine failure is NOT a defect — tag it
+            if tltk_fail < 3:
+                print(f"[tltk-fail] {w!r}: {e!r}", flush=True)
+            tltk_fail += 1
         if ipa and not defect(ipa):
             both.append({"word": w, "source": "wiki-agree",
                          "phonemic": ph, "tltk_ipa": ipa})
@@ -77,7 +83,7 @@ def main() -> None:
             royin_only.append({"word": w, "source": "wiki-royin",
                                "phonemic": ph})
     print(f"[wiki] agree={len(both)} royin_only={len(royin_only)} "
-          f"defects={defects}", flush=True)
+          f"defects={defects} tltk_fail={tltk_fail}", flush=True)
 
     for name, rows in (("agree", both), ("royin-only", royin_only)):
         rows.sort(key=lambda r: r["word"])
@@ -91,6 +97,7 @@ def main() -> None:
         "articles": ARTICLES, "min_freq": MIN_FREQ, "max_types": MAX_TYPES,
         "types": len(vocab), "agree": len(both),
         "royin_only": len(royin_only), "defects": defects,
+        "tltk_fail": tltk_fail,
         "engines": ["pythainlp-royin", "tltk-th2ipa"],
         "text_source": "wikimedia/wikipedia 20231101.th (CC-BY-SA)",
     }, indent=2))
