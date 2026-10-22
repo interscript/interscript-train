@@ -156,12 +156,19 @@ def main() -> None:
         print(f"[ckpt] oepoch-{ep} saved", flush=True)
 
     # ---- eval surfaces (run-047 protocol) ----
+    # NOTE: everything below the checkpoint saves is an epilogue — a
+    # missing dependency here must never fail a completed training run
+    # (run-080-r8-stage2 died here after 12.7h on `import pandas`).
     model.config.use_cache = True
     model.eval()
 
-    import pandas as pd
-
-    import pyarrow.parquet as pq
+    try:
+        import pandas as pd  # noqa: F401
+        import pyarrow.parquet as pq  # noqa: F401
+    except ImportError as e:
+        print(f"[epilogue] skipped: {e} — checkpoints are complete; "
+              "run eval_r8_stage2.py separately", flush=True)
+        return
 
     table = pq.read_table(DATA / "sadeeddiac-25.parquet")
     inputs = [DIACRITICS_RE.sub("", t) for t in
