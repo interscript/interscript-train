@@ -15,6 +15,7 @@ Usage (cpu-basic, isx-training mounted rw):
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -58,6 +59,12 @@ def main() -> None:
 
     vocab = [w for w, c in freq.most_common(MAX_TYPES) if c >= MIN_FREQ]
     print(f"[wiki] vocab after freq>={MIN_FREQ}: {len(vocab)}", flush=True)
+
+    if os.environ.get("DEBUG_DUMP"):
+        for w in vocab[:12]:
+            ph = transliterate(w, engine="royin").strip()
+            print(f"[dbg] {w!r} -> {ph!r} defect={defect(ph)}", flush=True)
+        return
 
     both, royin_only, defects, tltk_fail = [], [], 0, 0
     for w in vocab:
