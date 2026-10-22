@@ -58,7 +58,8 @@ def main() -> None:
 
     result = score_predictions(preds, gts)
     print(f"[eval] DER: {result}", flush=True)
-    (CKPT / "sadeed-verdict.json").write_text(
+    name = init.name if init.is_dir() else "best"
+    (CKPT / f"sadeed-verdict-{name}.json").write_text(
         json.dumps({"checkpoint": str(init), "verdict": result},
                    ensure_ascii=False, indent=2))
     print("[eval] verdict written", flush=True)
