@@ -220,6 +220,15 @@ def main() -> None:
                           "attention_mask": np.ones((1, 2), dtype=np.int64)})[0]
     else:
         h = es.run(None, {"input_ids": np.array([[104, 101]], dtype=np.int64)})[0]
+    # architecture guard: a wrong-checkpoint export (env-name trap,
+    # run-080-thai-v6a-export: the Arabic r8 byt5-BASE shipped under a
+    # Thai byt5-small id) passes the shape-only sanity — the encoder
+    # width must equal the loaded config's d_model
+    if h.shape[-1] != model.config.d_model:
+        raise SystemExit(
+            f"[sanity] FATAL: encoder d_model {h.shape[-1]} != config "
+            f"{model.config.d_model} — the exported graph is not this "
+            "checkpoint's architecture")
     lg = ds.run(None, {"input_ids": np.array([[0]], dtype=np.int64),
                        "encoder_hidden_states": h})[0]
     print(f"[sanity] logits shape {lg.shape}", flush=True)
