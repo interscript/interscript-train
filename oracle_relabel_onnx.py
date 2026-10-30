@@ -90,12 +90,15 @@ def lev(a: str, b: str) -> int:
 
 
 class Arm:
-    def __init__(self, name: str, zip_path: str):
+    def __init__(self, name: str, zip_path: str, force_cpu: bool = False,
+                 intra_threads: int = 0):
         import onnxruntime as ort
 
         self.name = name
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if intra_threads:
+            opts.intra_op_num_threads = intra_threads
         graphs, digests = {}, {}
         with zipfile.ZipFile(zip_path) as z:
             for member in z.namelist():
@@ -122,11 +125,15 @@ class Arm:
                     raise RuntimeError(f"{zip_path}:{fname} sha256 mismatch")
         providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
                      if p in ort.get_available_providers()]
+        if force_cpu:
+            providers = ["CPUExecutionProvider"]
         self.enc = ort.InferenceSession(graphs["encoder.onnx"], opts, providers)
         dname = ("decoder-kv.onnx"
                  if "decoder-kv.onnx" in graphs else "decoder.onnx")
         self.kv = "decoder-kv.onnx" in graphs
         self.dec = ort.InferenceSession(graphs[dname], opts, providers)
+        print(f"[{name}] EP={self.enc.get_providers()} kv={self.kv}",
+              flush=True)
         self.out_names = [o.name for o in self.dec.get_outputs()]
         self.pasts = {}
         for m in self.dec.get_inputs():
@@ -272,83 +279,136 @@ def decode_groups(nbytes: list[int], done: set[int],
     return groups
 
 
-def decode_arm(arm: Arm, srcs: list[str]) -> None:
-    raw = CKPT / f"preds-{arm.name}.raw.jsonl"
+def decode_arm(arm: Arm, srcs: list[str], skip: set[int] | None = None,
+               pool=None) -> None:
+    """Rotating part files (the khm-labeler pattern): the mount only
+    reliably flushes closed files, and HfFileSystem API sync 401s from
+    inside jobs — so durability = new part file every CHUNK rows.
+
+    skip: rows that need no decode (news cannot beat an exact r7 match;
+    ties go to r7) — they are treated as decoded for planning/resume.
+    pool: optional multiprocessing pool of CPU workers (int8 plain arm
+    is fastest as parallel CPU single-row; see the bench verdict).
+    """
+    CHUNK = 2000
+    skip = skip or set()
+    parts_dir = CKPT / f"parts-{arm.name}"
+    parts_dir.mkdir(parents=True, exist_ok=True)
     done: set[int] = set()
-    if raw.exists():
-        for line in raw.read_text(encoding="utf-8").splitlines():
+    for part in sorted(parts_dir.glob("part-*.jsonl")):
+        for line in part.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 done.add(json.loads(line)["i"])
-        print(f"[{arm.name}] resume: {len(done)} rows already decoded",
+    n_decodable = len(srcs) - len(skip)
+    if done:
+        print(f"[{arm.name}] resume: {len(done)}/{n_decodable} rows decoded",
               flush=True)
     nbytes = [len(s.encode()) + 1 for s in srcs]
     # plain-decoder exports are batch=1-traced (parity test: batched
     # plain decode corrupts; only the kv graph is batch-safe) — so the
     # int8 news arm always decodes single-row, exactly like the runtime
-    groups = decode_groups(nbytes, done, BS if arm.kv else 1)
+    groups = decode_groups(nbytes, done | skip, BS if arm.kv else 1)
     t0 = time.time()
     n_done = 0
-    with raw.open("a", encoding="utf-8") as f:
-        for gi, g in enumerate(groups):
-            preds = arm.decode_equal([srcs[i] for i in g])
-            for i, p in zip(g, preds):
-                f.write(json.dumps({"i": i, "p": p}, ensure_ascii=False) + "\n")
-            n_done += len(g)
-            f.flush()
-            if gi % 40 == 0:
-                try:
-                    sync_to_bucket(raw)
-                except Exception as e:  # noqa: BLE001
-                    print(f"[{arm.name}] sync failed: {e}", flush=True)
-            if gi % 20 == 0:
+    part_idx = len(list(parts_dir.glob("part-*.jsonl")))
+    f = (parts_dir / f"part-{part_idx:03d}.jsonl").open(
+        "w", encoding="utf-8")
+
+    def write(i: int, p: str) -> None:
+        nonlocal n_done, part_idx, f
+        f.write(json.dumps({"i": i, "p": p}, ensure_ascii=False) + "\n")
+        n_done += 1
+        if n_done % CHUNK == 0:
+            f.close()
+            part_idx += 1
+            f = (parts_dir / f"part-{part_idx:03d}.jsonl").open(
+                "w", encoding="utf-8")
+            print(f"[{arm.name}] part {part_idx - 1:03d} flushed",
+                  flush=True)
+
+    if pool is not None:
+        jobs = [(i, srcs[i]) for g in groups for i in g]
+        for i, p in pool.imap_unordered(_pool_worker, jobs, chunksize=4):
+            write(i, p)
+            if n_done % 100 == 0:
                 r = n_done / max(1, time.time() - t0)
-                rem = len(srcs) - len(done) - n_done
-                print(f"[{arm.name}] {n_done}/{len(srcs) - len(done)} "
-                      f"({r:.0f} rows/s, eta {rem / max(r, 1) / 3600:.1f}h)",
-                      flush=True)
-    try:
-        sync_to_bucket(raw)
-    except Exception as e:  # noqa: BLE001
-        print(f"[{arm.name}] final sync failed: {e}", flush=True)
+                print(f"[{arm.name}] {n_done}/{n_decodable} "
+                      f"({r:.1f} rows/s)", flush=True)
+        f.close()
+        print(f"[{arm.name}] done ({n_done} this session)", flush=True)
+        return
+
+    for gi, g in enumerate(groups):
+        preds = arm.decode_equal([srcs[i] for i in g])
+        for i, p in zip(g, preds):
+            write(i, p)
+        if gi % 20 == 0:
+            r = n_done / max(1, time.time() - t0)
+            rem = n_decodable - len(done) - n_done
+            print(f"[{arm.name}] {n_done}/{n_decodable} "
+                  f"({r:.1f} rows/s, eta {rem / max(r, 1) / 3600:.1f}h)",
+                  flush=True)
+    f.close()
+    print(f"[{arm.name}] done ({n_done} this session)", flush=True)
 
 
-def raw_preds(name: str, n: int) -> list[str] | None:
-    raw = CKPT / f"preds-{name}.raw.jsonl"
-    if not raw.exists():
-        return None
+_WORKER_ARM = None
+
+
+def _pool_worker(job: tuple[int, str]) -> tuple[int, str]:
+    global _WORKER_ARM
+    if _WORKER_ARM is None:
+        _WORKER_ARM = Arm("news", ARMS[-1][1], force_cpu=True,
+                          intra_threads=2)
+    i, src = job
+    return i, _WORKER_ARM.decode_equal([src])[0]
+
+
+def raw_preds(name: str, n: int, skip: set[int] | None = None):
+    skip = skip or set()
+    parts_dir = CKPT / f"parts-{name}"
     by_i: dict[int, str] = {}
-    for line in raw.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            r = json.loads(line)
-            by_i[r["i"]] = r["p"]
-    if len(by_i) < n:
-        print(f"[{name}] raw covers {len(by_i)}/{n} rows", flush=True)
+    for part in sorted(parts_dir.glob("part-*.jsonl")):
+        for line in part.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                by_i[r["i"]] = r["p"]
+    have = len(by_i) + len(skip - set(by_i))
+    if have < n:
+        print(f"[{name}] raw covers {have}/{n} rows", flush=True)
         return None
-    return [by_i[i] for i in range(n)]
+    return [by_i.get(i) for i in range(n)]
 
 
 def consolidate(rows: list[tuple[str, str]],
-                preds: dict[str, list[str]]) -> None:
+                preds: dict[str, list[str | None]]) -> None:
     with (CKPT / "arm-preds.jsonl").open("w", encoding="utf-8") as f, \
          (CKPT / "oracle-targets.jsonl").open("w", encoding="utf-8") as g:
         cers = {n: 0.0 for n, _ in ARMS}
+        eval_n = {n: 0 for n, _ in ARMS}
         oracle_cer = 0.0
         disagree = 0
         for i, (src, silver) in enumerate(rows):
             row_preds = {n: preds[n][i] for n, _ in ARMS}
-            if len(set(row_preds.values())) > 1:
+            if len({p for p in row_preds.values() if p is not None}) > 1:
                 disagree += 1
-            best_name, best_d = ARMS[0][0], lev(row_preds[ARMS[0][0]], silver)
-            best_tgt = row_preds[ARMS[0][0]]
+            primary = ARMS[0][0]
+            best_name, best_d = primary, lev(row_preds[primary], silver)
+            best_tgt = row_preds[primary]
             for n, _ in ARMS[1:]:
+                if row_preds[n] is None:  # skipped: cannot beat the tie
+                    continue
                 d = lev(row_preds[n], silver)
                 if d < best_d:
                     best_name, best_d, best_tgt = n, d, row_preds[n]
             for n in cers:
+                if row_preds[n] is None:
+                    continue
                 cers[n] += lev(row_preds[n], silver) / max(1, len(silver))
+                eval_n[n] += 1
             oracle_cer += best_d / max(1, len(silver))
-            f.write(json.dumps({"src": src, "silver": silver, **row_preds},
-                               ensure_ascii=False) + "\n")
+            f.write(json.dumps({"src": src, "silver": silver,
+                                **row_preds}, ensure_ascii=False) + "\n")
             g.write(json.dumps({"src": src, "tgt": best_tgt,
                                 "pick": best_name}, ensure_ascii=False) + "\n")
     n = len(rows)
@@ -358,7 +418,9 @@ def consolidate(rows: list[tuple[str, str]],
         p = json.loads(l)["pick"]
         picks[p] = picks.get(p, 0) + 1
     stats = {"rows": n, "disagreement": round(disagree / n, 4),
-             "arm_cer": {k: round(v / n, 4) for k, v in cers.items()},
+             "arm_cer": {k: round(v / max(1, eval_n[k]), 4)
+                         for k, v in cers.items()},
+             "arm_eval_rows": eval_n,
              "oracle_cer": round(oracle_cer / n, 4), "picks": picks}
     print(json.dumps(stats), flush=True)
     (CKPT / "relabel_stats.json").write_text(json.dumps(stats, indent=1))
@@ -368,12 +430,41 @@ def main() -> None:
     CKPT.mkdir(parents=True, exist_ok=True)
     rows = build_rows()
     srcs = [s for s, _ in rows]
-    loaded = [(n, Arm(n, p)) for n, p in ARMS]
-    for name, arm in loaded:
-        decode_arm(arm, srcs)
-    preds = {}
-    for name, _ in loaded:
-        p = raw_preds(name, len(rows))
+    silvers = [t for _, t in rows]
+    primary_name, primary_zip = ARMS[0]
+    primary = Arm(primary_name, primary_zip)
+    decode_arm(primary, srcs)
+    p_primary = raw_preds(primary_name, len(rows))
+    if p_primary is None:
+        print(f"[consolidate] waiting on arm {primary_name}", flush=True)
+        return
+    skip = {i for i in range(len(rows)) if lev(p_primary[i], silvers[i]) == 0}
+    print(f"[skip] {len(skip)}/{len(rows)} rows exact under {primary_name} "
+          f"— news cannot beat a tie; skipped", flush=True)
+    (CKPT / "skip.json").write_text(json.dumps(sorted(skip)))
+    mode = os.environ.get("D_NEWS_MODE", "gpu")
+    if mode == "cpu":
+        news = Arm(ARMS[-1][0], ARMS[-1][1], force_cpu=True,
+                   intra_threads=4)
+    else:
+        news = Arm(ARMS[-1][0], ARMS[-1][1])
+    pool = None
+    if mode == "cpu_par":
+        import multiprocessing as mp
+
+        # spawn, not fork: the parent already initialized the CUDA
+        # context for the primary arm; forked children must not inherit it
+        pool = mp.get_context("spawn").Pool(
+            int(os.environ.get("D_NEWS_PROCS", "8")))
+    try:
+        decode_arm(news, srcs, skip=skip, pool=pool)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    preds = {primary_name: p_primary}
+    for name, _ in ARMS[1:]:
+        p = raw_preds(name, len(rows), skip=skip)
         if p is None:
             print(f"[consolidate] waiting on arm {name}", flush=True)
             return
