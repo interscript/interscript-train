@@ -218,7 +218,11 @@ def build_rows() -> list[tuple[str, str]]:
     def add_silver(tgt: str) -> None:
         tgt = tgt.strip()
         src = DIACRITICS_RE.sub("", tgt).strip()
-        if len(src) >= 5 and len(src.encode()) <= WINDOW - 50:
+        # D_MAXB caps the decode length (default 550 = the recorded
+        # recipe; 300 was used for tractable corpus-scale relabeling —
+        # recorded in relabel_stats)
+        if (len(src) >= 5 and len(src.encode()) <= WINDOW - 50
+                and len(src.encode()) <= int(os.environ.get("D_MAXB", "550"))):
             pseudo.append((src, tgt))
 
     for aline in articles:
@@ -419,6 +423,7 @@ def consolidate(rows: list[tuple[str, str]],
         p = json.loads(l)["pick"]
         picks[p] = picks.get(p, 0) + 1
     stats = {"rows": n, "disagreement": round(disagree / n, 4),
+             "maxb": int(os.environ.get("D_MAXB", "550")),
              "arm_cer": {k: round(v / max(1, eval_n[k]), 4)
                          for k, v in cers.items()},
              "arm_eval_rows": eval_n,
@@ -466,45 +471,51 @@ def main() -> None:
     rows = build_rows()
     srcs = [s for s, _ in rows]
     silvers = [t for _, t in rows]
-    primary_name, primary_zip = ARMS[0]
-    primary = Arm(primary_name, primary_zip)
-    decode_arm(primary, srcs)
-    p_primary = raw_preds(primary_name, len(rows))
-    if p_primary is None:
-        print(f"[consolidate] waiting on arm {primary_name}", flush=True)
-        return
-    skip = {i for i in range(len(rows)) if lev(p_primary[i], silvers[i]) == 0}
-    print(f"[skip] {len(skip)}/{len(rows)} rows exact under {primary_name} "
-          f"— news cannot beat a tie; skipped", flush=True)
-    (CKPT / "skip.json").write_text(json.dumps(sorted(skip)))
-    mode = os.environ.get("D_NEWS_MODE", "gpu")
-    if mode == "cpu":
-        news = Arm(ARMS[-1][0], ARMS[-1][1], force_cpu=True,
-                   intra_threads=4)
-    else:
-        news = Arm(ARMS[-1][0], ARMS[-1][1])
-    pool = None
-    if mode == "cpu_par":
-        import multiprocessing as mp
+    arm_only = os.environ.get("D_ARM_ONLY")
+    skip: set[int] = set()
 
-        # spawn, not fork: the parent already initialized the CUDA
-        # context for the primary arm; forked children must not inherit it
-        pool = mp.get_context("spawn").Pool(
-            int(os.environ.get("D_NEWS_PROCS", "8")))
-    try:
-        decode_arm(news, srcs, skip=skip, pool=pool)
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
-    preds = {primary_name: p_primary}
-    for name, _ in ARMS[1:]:
-        p = raw_preds(name, len(rows), skip=skip)
-        if p is None:
-            print(f"[consolidate] waiting on arm {name}", flush=True)
+    if not arm_only or arm_only == ARMS[0][0]:
+        primary = Arm(ARMS[0][0], ARMS[0][1])
+        decode_arm(primary, srcs)
+
+    if not arm_only:
+        # sequential mode: the tie-skip needs the primary's full preds
+        p0 = raw_preds(ARMS[0][0], len(rows))
+        if p0 is None:
+            print(f"[consolidate] waiting on arm {ARMS[0][0]}", flush=True)
             return
-        preds[name] = p
-    consolidate(rows, preds)
+        skip = {i for i in range(len(rows))
+                if lev(p0[i], silvers[i]) == 0}
+        print(f"[skip] {len(skip)}/{len(rows)} rows exact under "
+              f"{ARMS[0][0]} — arm2 cannot beat a tie; skipped", flush=True)
+        (CKPT / "skip.json").write_text(json.dumps(sorted(skip)))
+
+    if not arm_only or arm_only != ARMS[0][0]:
+        second = Arm(ARMS[-1][0], ARMS[-1][1])
+        pool = None
+        if os.environ.get("D_NEWS_MODE") == "cpu_par":
+            import multiprocessing as mp
+
+            # spawn, not fork: the parent may hold a CUDA context
+            pool = mp.get_context("spawn").Pool(
+                int(os.environ.get("D_NEWS_PROCS", "8")))
+        try:
+            decode_arm(second, srcs, skip=skip, pool=pool)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+    # consolidation runs in whichever job sees both arms complete
+    p0 = raw_preds(ARMS[0][0], len(rows))
+    p1 = raw_preds(ARMS[-1][0], len(rows), skip=skip)
+    if p0 is None:
+        print(f"[consolidate] waiting on arm {ARMS[0][0]}", flush=True)
+        return
+    if p1 is None:
+        print(f"[consolidate] waiting on arm {ARMS[-1][0]}", flush=True)
+        return
+    consolidate(rows, {ARMS[0][0]: p0, ARMS[-1][0]: p1})
     (CKPT / "RELABEL_DONE").write_text("ok\n")
     try:
         sync_to_bucket(CKPT / "RELABEL_DONE")
