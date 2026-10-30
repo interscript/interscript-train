@@ -49,7 +49,8 @@ SMOKE = bool(os.environ.get("D_SMOKE"))
 BS = int(os.environ.get("D_BS", "48"))
 ARMS = [
     ("r7", "/ckpt/b3-arms/ara-diac-2.0-fp32.zip"),
-    ("news", "/ckpt/b3-arms/ara-diac-news-1.0.zip"),
+    (os.environ.get("D_ARM2_NAME", "news"),
+     os.environ.get("D_ARM2_ZIP", "/ckpt/b3-arms/ara-diac-news-1.0.zip")),
 ]
 DIACRITICS_RE = re.compile("[ؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۨ-ۭ]")
 
@@ -428,6 +429,40 @@ def consolidate(rows: list[tuple[str, str]],
 
 def main() -> None:
     CKPT.mkdir(parents=True, exist_ok=True)
+    arm2_url = os.environ.get("D_ARM2_URL")
+    parts_spec = os.environ.get("D_ARM2_PARTS")  # url|sha,url|sha,...
+    if parts_spec:
+        import hashlib
+        import urllib.request
+
+        dst = Path(ARMS[-1][1])
+        if not dst.exists():
+            with dst.open("wb") as out:
+                for spec in parts_spec.split(","):
+                    url, want = spec.rsplit("|", 1)
+                    print(f"[fetch] {url}", flush=True)
+                    with urllib.request.urlopen(url) as r:
+                        blob = r.read()
+                    got = hashlib.sha256(blob).hexdigest()
+                    if got != want:
+                        raise RuntimeError(
+                            f"part sha256 mismatch {got} != {want}")
+                    out.write(blob)
+        print(f"[fetch] arm2 assembled {dst} ({dst.stat().st_size} B)",
+              flush=True)
+    elif arm2_url:
+        import hashlib
+        import urllib.request
+
+        dst = Path(ARMS[-1][1])
+        want = os.environ.get("D_ARM2_SHA", "")
+        if not dst.exists():
+            print(f"[fetch] {arm2_url}", flush=True)
+            urllib.request.urlretrieve(arm2_url, dst)
+        got = hashlib.sha256(dst.read_bytes()).hexdigest()
+        if want and got != want:
+            raise RuntimeError(f"arm2 sha256 mismatch {got} != {want}")
+        print(f"[fetch] arm2 sha256 OK ({got[:12]})", flush=True)
     rows = build_rows()
     srcs = [s for s, _ in rows]
     silvers = [t for _, t in rows]
