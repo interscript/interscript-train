@@ -48,7 +48,8 @@ SUBSET = int(os.environ.get("D_SUBSET", "300000"))
 SMOKE = bool(os.environ.get("D_SMOKE"))
 BS = int(os.environ.get("D_BS", "48"))
 ARMS = [
-    ("r7", "/ckpt/b3-arms/ara-diac-2.0-fp32.zip"),
+    (os.environ.get("D_ARM1_NAME", "r7"),
+     os.environ.get("D_ARM1_ZIP", "/ckpt/b3-arms/ara-diac-2.0-fp32.zip")),
     (os.environ.get("D_ARM2_NAME", "news"),
      os.environ.get("D_ARM2_ZIP", "/ckpt/b3-arms/ara-diac-news-1.0.zip")),
 ]
@@ -208,7 +209,32 @@ def split_windows(text: str, budget: int = WINDOW) -> list[str]:
 
 
 def build_rows() -> list[tuple[str, str]]:
-    """run-047's exact qcri-only silver corpus, stripped, shuffled."""
+    """run-047's exact qcri-only silver corpus, stripped, shuffled.
+
+    D_ROWS_JSONL switches to a pre-paired corpus: a jsonl of {"src",
+    "tgt"} rows (e.g. the urd-dia train split), stripped of diacritics
+    on the src side, seed-42 shuffled, subset taken after the shuffle.
+    """
+    rows_path = os.environ.get("D_ROWS_JSONL")
+    if rows_path:
+        pairs: list[tuple[str, str]] = []
+        maxb = int(os.environ.get("D_MAXB", "550"))
+        for line in Path(rows_path).read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            tgt = str(r.get("tgt", "")).strip()
+            src = DIACRITICS_RE.sub("", str(r.get("src", ""))).strip()
+            if len(src) >= 5 and len(src.encode()) <= maxb:
+                pairs.append((src, tgt))
+            if len(pairs) >= PSEUDO_CAP:
+                break
+        rng = random.Random(42)
+        rng.shuffle(pairs)
+        rows = pairs[:SUBSET]
+        print(f"[data] jsonl rows={len(pairs)} subset={len(rows)}",
+              flush=True)
+        return rows
     qpath = DATA / "qcri-wiki.jsonl"
     articles = qpath.read_text(encoding="utf-8").splitlines()
     rng2 = random.Random(7)
