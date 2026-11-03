@@ -166,6 +166,51 @@ def main() -> None:
     model.config.use_cache = True
     model.eval()
 
+    # language-generic eval: greedy CER on a {src, tgt} jsonl (e.g. the
+    # corpus val split), used when the oracle targets are not Arabic
+    eval_jsonl = os.environ.get("O_EVAL_JSONL")
+    if eval_jsonl:
+        import json as _json
+
+        def _cer(preds, golds):
+            def lev(a, b):
+                if len(a) < len(b):
+                    a, b = b, a
+                prev = list(range(len(b) + 1))
+                for i, ca in enumerate(a, 1):
+                    cur = [i]
+                    for j, cb in enumerate(b, 1):
+                        cur.append(min(prev[j] + 1, cur[-1] + 1,
+                                       prev[j - 1] + (ca != cb)))
+                    prev = cur
+                return prev[-1]
+            tot_d, tot_l = 0, 0
+            for p, g in zip(preds, golds):
+                tot_d += lev(p, g)
+                tot_l += len(g)
+            return 100.0 * tot_d / max(tot_l, 1)
+
+        rows = [_json.loads(l) for l in
+                Path(eval_jsonl).read_text(encoding="utf-8")
+                .splitlines() if l.strip()][:1200]
+        srcs = [DIACRITICS_RE.sub("", str(r.get("src", ""))).strip()
+                for r in rows]
+        golds = [str(r.get("tgt", "")).strip() for r in rows]
+        preds = []
+        with torch.no_grad():
+            for i in range(0, len(srcs), 32):
+                enc = tok(srcs[i:i + 32], return_tensors="pt", padding=True,
+                          truncation=True, max_length=WINDOW).to("cuda")
+                with torch.autocast("cuda", torch.bfloat16):
+                    gen = model.generate(**enc, max_new_tokens=WINDOW * 2,
+                                         num_beams=1)
+                preds.extend(tok.batch_decode(gen,
+                                              skip_special_tokens=True))
+        cer = _cer(preds, golds)
+        print(f'{{"eval": "O_EVAL_JSONL", "rows": {len(rows)}, '
+              f'"CER": {cer:.4f}}}', flush=True)
+        return
+
     try:
         import pandas as pd  # noqa: F401
         import pyarrow.parquet as pq  # noqa: F401
