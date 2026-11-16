@@ -483,6 +483,12 @@ def run_distill():
         torch.save(student.state_dict(), ck / "student.pt")
         torch.save(optimizer.state_dict(), ck / "optim.pt")
         (ck / "labels.sha").write_text(labels_digest)
+        keep = sorted(CKPT.glob("step-*"),
+                      key=lambda p: int(p.name.split("-")[1]))
+        for old in keep[:-2]:
+            for f in old.iterdir():
+                f.unlink()
+            old.rmdir()
 
     log(f"train: {len(rows)} pairs x {EPOCHS} epochs = {total_steps} steps, "
         f"alpha={ALPHA} T={TEMP} beta={BETA} "
