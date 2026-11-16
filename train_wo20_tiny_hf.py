@@ -81,7 +81,8 @@ LABELS_SHA = None  # pinned from teachers-sha256.txt at fetch time
 STUDENT_INIT = "google/byt5-small"
 TEACHER_TOK = "google/byt5-base"
 
-PAIRS_MAX_BYTES = 384     # the 2.0 recipe's Pairs filter, verbatim
+PAIRS_MAX_BYTES = 1450    # the ara spec's max_len: units <= 1450 B
+LABEL_CAP_BYTES = 2900    # the lineage's label cap = 2 x max_len
 BS = 8
 EPOCHS = int(os.environ.get("WO20_EPOCHS", "3"))
 ALPHA = float(os.environ.get("WO20_ALPHA", "0.5"))
@@ -197,7 +198,7 @@ def load_pairs(labels_path: Path) -> list[tuple[str, str]]:
         s = (row.get("src") or "").strip()
         t = (row.get("tgt") or row.get("teacher") or "").strip()
         if s and t and len(s.encode()) <= PAIRS_MAX_BYTES \
-                and len(t.encode()) <= PAIRS_MAX_BYTES:
+                and len(t.encode()) <= LABEL_CAP_BYTES:
             rows.append((s, t))
     if not rows:
         raise SystemExit("no usable label pairs — check the labels file "
@@ -408,6 +409,8 @@ def run_distill():
     for p in teacher.parameters():
         p.requires_grad_(False)
     student = AutoModelForSeq2SeqLM.from_pretrained(STUDENT_INIT).cuda()
+    student.gradient_checkpointing_enable()
+    student.config.use_cache = False
     student.train()
 
     # frozen bridges: pred_t = (h_s @ B) @ A + bias
@@ -435,8 +438,10 @@ def run_distill():
             return rows[i]
 
     def collate(batch):
-        src = tok([s for s, _ in batch], padding=True, return_tensors="pt")
-        labels = tok([t for _, t in batch], padding=True,
+        src = tok([s for s, _ in batch], padding=True, truncation=True,
+                  max_length=PAIRS_MAX_BYTES, return_tensors="pt")
+        labels = tok([t for _, t in batch], padding=True, truncation=True,
+                     max_length=LABEL_CAP_BYTES,
                      return_tensors="pt").input_ids
         labels[labels == tok.pad_token_id] = -100
         return src.input_ids, src.attention_mask, labels
@@ -542,6 +547,8 @@ def run_distill():
     student.save_pretrained(out_dir)
     tok.save_pretrained(out_dir)
     log(f"final student saved -> {out_dir}")
+    student.gradient_checkpointing_disable()
+    student.config.use_cache = True
     run_eval(student, tok, teacher)
 
 
