@@ -68,7 +68,9 @@ sys.path.insert(0, "/code")
 
 RUN = os.environ.get("WO20_RUN", "wo20-tiny")
 STAGE = os.environ.get("WO20_STAGE", "scan")
+SCAN_RUN = os.environ.get("WO20_SCAN_RUN", "wo20-tiny-scan")
 CKPT = Path("/ckpt") / RUN
+SCAN_CKPT = Path("/ckpt") / SCAN_RUN
 WORK = Path("/tmp/wo20")
 
 RELEASE = ("https://github.com/interscript/interscript-models/"
@@ -388,11 +390,11 @@ def run_distill():
     from wo20_muon import Muon, split_parameters
 
     CKPT.mkdir(parents=True, exist_ok=True)
-    bridges_file = CKPT / "bridges.npz"
+    bridges_file = SCAN_CKPT / "bridges.npz"
     if not bridges_file.exists():
         raise SystemExit("bridges.npz missing — run the scan stage first "
                          "(the kill rule gates this stage)")
-    scan = json.loads((CKPT / "scan.json").read_text())
+    scan = json.loads((SCAN_CKPT / "scan.json").read_text())
     if scan.get("verdict") != "ARMED":
         raise SystemExit(f"scan verdict is {scan.get('verdict')} — "
                          "distillation is not armed")
