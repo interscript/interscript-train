@@ -413,11 +413,14 @@ def run_distill():
     # frozen bridges: pred_t = (h_s @ B) @ A + bias
     bridges = []
     for meta in pairs_meta:
-        k = meta["student_layer"]
+        if isinstance(meta, dict):
+            k, l = meta["student_layer"], meta["teacher_layer"]
+        else:
+            k, l = int(meta[0]), int(meta[1])
         B = torch.from_numpy(npz[f"B_L{k}"]).cuda()
         A = torch.from_numpy(npz[f"A_L{k}"]).cuda()
         bias = torch.from_numpy(npz[f"bias_L{k}"]).cuda()
-        bridges.append((k, meta["teacher_layer"], B, A, bias))
+        bridges.append((k, l, B, A, bias))
     for _, _, B, A, _ in bridges:
         B.requires_grad_(False)
         A.requires_grad_(False)
