@@ -695,11 +695,24 @@ def run_eval(student, tok, teacher):
     s_wer = np.zeros(n)
     t_wer = np.zeros(n)
     words = np.zeros(n)
+    n_skipped = 0
     for i in range(n):
-        wc, lc, _, sw, _, sd, _ = ev.caculate_error_on_single_sentence(
-            student_paras[i], gt[i], gt_missing_diacritic_is_error=False)
-        _, _, _, tw, _, td, _ = ev.caculate_error_on_single_sentence(
-            teacher_paras[i], gt[i], gt_missing_diacritic_is_error=False)
+        # word-count-mismatch paragraphs raise inside the evaluator —
+        # skipped PAIRWISE (zeroed: the count-weighted aggregates and
+        # the bootstrap's counts>0 filter drop them), the evaluator's
+        # own aggregate behavior; ~59 of 1,200 in the seed-1 lineage.
+        counts = {}
+        for name, pred in (("s", student_paras[i]), ("t", teacher_paras[i])):
+            try:
+                counts[name] = ev.caculate_error_on_single_sentence(
+                    pred, gt[i], gt_missing_diacritic_is_error=False)
+            except RuntimeError:
+                counts[name] = None
+        if counts["s"] is None or counts["t"] is None:
+            n_skipped += 1
+            continue
+        wc, lc, _, sw, _, sd, _ = counts["s"]
+        _, _, _, tw, _, td, _ = counts["t"]
         words[i], letters[i] = wc, max(lc, 1)
         s_wer[i], t_wer[i] = sw, tw
         s_der[i] = 100.0 * sd / max(lc, 1)
@@ -731,6 +744,7 @@ def run_eval(student, tok, teacher):
         "p_student_worse": p_worse,
         "verdict": verdict,
         "n_paragraphs": n,
+        "n_skipped_wordcount_mismatch": n_skipped,
     }
     log("RESULT " + json.dumps(result))
     (CKPT / "final_eval.json").write_text(json.dumps(result, indent=1))
