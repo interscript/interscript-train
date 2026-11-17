@@ -6,6 +6,7 @@
 #   "pyarrow",
 #   "pyarabic",
 #   "prettytable",
+#   "tqdm",
 # ]
 # ///
 """WO20u M1 — multi-seed confirmation scorer (issue #441 follow-up).
