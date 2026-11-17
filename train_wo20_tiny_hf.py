@@ -69,6 +69,7 @@ sys.path.insert(0, "/code")
 RUN = os.environ.get("WO20_RUN", "wo20-tiny")
 STAGE = os.environ.get("WO20_STAGE", "scan")
 SCAN_RUN = os.environ.get("WO20_SCAN_RUN", "wo20-tiny-scan")
+SEED = int(os.environ.get("WO20_SEED", "0"))  # 0 = unseeded (the seed-1 run)
 CKPT = Path("/ckpt") / RUN
 SCAN_CKPT = Path("/ckpt") / SCAN_RUN
 WORK = Path("/tmp/wo20")
@@ -391,6 +392,16 @@ def run_distill():
     from wo20_muon import Muon, split_parameters
 
     CKPT.mkdir(parents=True, exist_ok=True)
+    if SEED:
+        # WO20u M1 multi-seed: explicit independent draw of the identical
+        # recipe (seed 1 ran unseeded — entropy seed — recorded as such).
+        import random
+
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        log(f"seed: WO20_SEED={SEED} (torch/numpy/python/data-worker)")
     bridges_file = SCAN_CKPT / "bridges.npz"
     if not bridges_file.exists():
         raise SystemExit("bridges.npz missing — run the scan stage first "
@@ -446,8 +457,20 @@ def run_distill():
         labels[labels == tok.pad_token_id] = -100
         return src.input_ids, src.attention_mask, labels
 
+    loader_gen = None
+    worker_init = None
+    if SEED:
+        def _worker_init(wid):
+            wseed = SEED + wid
+            random.seed(wseed)
+            np.random.seed(wseed)
+            torch.manual_seed(wseed)
+        loader_gen = torch.Generator()
+        loader_gen.manual_seed(SEED)
+        worker_init = _worker_init
     loader = DataLoader(P(), batch_size=BS, shuffle=True, collate_fn=collate,
-                        num_workers=2, drop_last=True)
+                        num_workers=2, drop_last=True, generator=loader_gen,
+                        worker_init_fn=worker_init)
     total_steps = len(loader) * EPOCHS
     muon_params, adamw_params = split_parameters(
         list(student.named_parameters()))
@@ -499,7 +522,7 @@ def run_distill():
             old.rmdir()
 
     log(f"train: {len(rows)} pairs x {EPOCHS} epochs = {total_steps} steps, "
-        f"alpha={ALPHA} T={TEMP} beta={BETA} "
+        f"alpha={ALPHA} T={TEMP} beta={BETA} seed={SEED or 'unseeded'} "
         f"bridges={[(k, l) for k, l, *_ in bridges]}")
 
     while step < total_steps:
@@ -694,6 +717,7 @@ def run_eval(student, tok, teacher):
         "run": RUN,
         "recipe": {"alpha": ALPHA, "temperature": TEMP, "beta": BETA,
                    "epochs": EPOCHS, "bs": BS,
+                   "seed": SEED or "unseeded",
                    "pairs_max_bytes": PAIRS_MAX_BYTES,
                    "student_init": STUDENT_INIT,
                    "labels_sha256": LABELS_SHA},
