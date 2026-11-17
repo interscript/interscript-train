@@ -718,11 +718,15 @@ def run_eval(student, tok, teacher):
         s_der[i] = 100.0 * sd / max(lc, 1)
         t_der[i] = 100.0 * td / max(lc, 1)
 
-    s_total = float(100.0 * (s_der * letters).sum() / letters.sum())
-    t_total = float(100.0 * (t_der * letters).sum() / letters.sum())
+    # per-paragraph DER/WER arrays are already percentage points; the
+    # aggregate is the letter/word-count-weighted mean (the pre-fix
+    # extra 100.0 factor double-scaled the totals — the paired
+    # delta/CI/p were always correct).
+    s_total = float((s_der * letters).sum() / max(letters.sum(), 1))
+    t_total = float((t_der * letters).sum() / max(letters.sum(), 1))
     delta, lo, hi, p_worse = paired_bootstrap(t_der, s_der, letters)
-    t_wer_total = float(100.0 * (t_wer * words).sum() / max(words.sum(), 1))
-    s_wer_total = float(100.0 * (s_wer * words).sum() / max(words.sum(), 1))
+    t_wer_total = float((t_wer * words).sum() / max(words.sum(), 1))
+    s_wer_total = float((s_wer * words).sum() / max(words.sum(), 1))
     gate = t_total + 0.5
     verdict = ("GATE-FAIL" if s_total > gate else "GATE-PASS")
     result = {
