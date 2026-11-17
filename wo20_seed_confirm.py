@@ -190,11 +190,13 @@ def main():
 
     scorable = letters > 0
     n_scorable = int(scorable.sum())
-    seed_total = float(100.0 * (der_seed[scorable]
-                                * letters[scorable]).sum()
+    # der_* arrays are already in percentage points (per-paragraph
+    # DER-CE); the aggregate is their letter-count-weighted mean.
+    seed_total = float((der_seed[scorable]
+                        * letters[scorable]).sum()
                        / letters[scorable].sum())
-    g2a_total = float(100.0 * (der_g2a[scorable]
-                               * letters[scorable]).sum()
+    g2a_total = float((der_g2a[scorable]
+                       * letters[scorable]).sum()
                       / letters[scorable].sum())
     delta, lo, hi, p = paired_bootstrap(der_g2a, der_seed, letters)
     separated = hi < 0  # CI entirely negative: separated improvement
