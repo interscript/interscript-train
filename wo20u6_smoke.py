@@ -89,8 +89,13 @@ def main():
     scan = json.loads(Path("/ckpt/wo20-tiny-scan/scan.json").read_text())
     checks["scan_verdict"] = scan.get("verdict")
     npz = np.load("/ckpt/wo20-tiny-scan/bridges.npz")
-    pairs = [(int(m["student_layer"]), int(m["teacher_layer"]))
-             for m in scan["armed_pairs"]]
+    pairs = []
+    for m in scan["armed_pairs"]:
+        if isinstance(m, dict):
+            pairs.append((int(m["student_layer"]),
+                          int(m["teacher_layer"])))
+        else:
+            pairs.append((int(m[0]), int(m[1])))
     missing = [f"B_L{k}" for k, _ in pairs
                if f"B_L{k}" not in npz.files]
     checks["armed_pairs"] = pairs
