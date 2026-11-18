@@ -83,7 +83,21 @@ def job_stage(jid):
         return "UNKNOWN"
     rows = json.loads(r.stdout)
     rows = rows if isinstance(rows, list) else [rows]
-    return rows[0].get("status") or "UNKNOWN"
+    st = rows[0].get("status") or "UNKNOWN"
+    if isinstance(st, dict):  # inspect --json nests {'stage': ..., ...}
+        st = st.get("stage") or "UNKNOWN"
+    return st
+
+
+def find_active_distill():
+    """Adopt an already-running/scheduling distill instead of launching
+    a second one (idempotent restarts; one long-running execution per
+    resource)."""
+    for r in jobs_now():
+        if r.get("status") in ("RUNNING", "SCHEDULING") \
+                and r.get("labels", {}).get("name") == "wo20u-6ep-distill":
+            return r.get("id")
+    return None
 
 
 def wait_terminal(jid):
@@ -151,16 +165,20 @@ def main():
         if confirm_done():
             break
         if not final_eval_done():
-            nbig, who = big_running()
-            log(f"r{round_no}: big-GPU in use {nbig} {who} "
-                f"(cap {MAX_BIG})")
-            while nbig >= MAX_BIG:
-                time.sleep(180)
+            jid = find_active_distill()
+            if jid:
+                log(f"r{round_no}: adopting active distill {jid[:8]}")
+            else:
                 nbig, who = big_running()
-            jid = launch(TRAINER, f"wo20u-6ep-distill",
-                         [f"WO20_STAGE=distill", f"WO20_RUN={RUN}",
-                          f"WO20_SEED={SEED}", f"WO20_EPOCHS={EPOCHS}"],
-                         "a100-large")
+                log(f"r{round_no}: big-GPU in use {nbig} {who} "
+                    f"(cap {MAX_BIG})")
+                while nbig >= MAX_BIG:
+                    time.sleep(180)
+                    nbig, who = big_running()
+                jid = launch(TRAINER, f"wo20u-6ep-distill",
+                             [f"WO20_STAGE=distill", f"WO20_RUN={RUN}",
+                              f"WO20_SEED={SEED}",
+                              f"WO20_EPOCHS={EPOCHS}"], "a100-large")
             if jid is None:
                 time.sleep(180)
                 continue
