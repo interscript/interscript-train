@@ -55,7 +55,7 @@ sys.path.insert(0, "/code")
 
 RUN = os.environ.get("WO20_RUN", "wo20-tiny-g2w-s2")
 CKPT = Path("/ckpt") / RUN
-OUT = Path("/ckpt") / "wo20u-m1"
+OUT = Path("/ckpt") / os.environ.get("WO20U_OUT_DIR", "wo20u-m1")
 FPV1 = ("https://github.com/interscript/interscript-models/"
         "releases/download/frontier-predictions-v1")
 G2A_PREDS = "run-007-r7-muon-6ep-final_preds.jsonl"
