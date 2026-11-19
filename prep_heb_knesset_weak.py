@@ -139,7 +139,7 @@ def main() -> None:
 
     # ---- 1. fetch + pin the upstream archive ----
     archive_path = Path(hf_hub_download(UPSTREAM, ARCHIVE, repo_type="dataset"))
-    arch_sha = sha256_file(arch_path)
+    arch_sha = sha256_file(archive_path)
     arch_size = archive_path.stat().st_size
     print(f"[fetch] {ARCHIVE} size={arch_size} sha256={arch_sha}", flush=True)
     KNOWN_SIZE = 142_845_067  # observed 2026-11-19; upstream re-upload changes this
