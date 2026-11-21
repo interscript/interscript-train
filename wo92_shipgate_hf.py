@@ -189,7 +189,7 @@ def main() -> None:
         return preds
 
     slice_rows = load_slice()
-    ref_rows = []
+    torch_rows = []
     calib_inputs: list[torch.Tensor] = []   # real encoded ids (cpu)
     calib_preds: list[torch.Tensor] = []    # reference predictions (cpu)
     for i, row in enumerate(slice_rows):
@@ -197,18 +197,18 @@ def main() -> None:
         skel, _ = NP.split_planes(src)
         ids_cpu = torch.tensor([encode_ids(skel)], dtype=torch.long)
         preds = torch_predict(ids_cpu)
-        ref_rows.append({"input": src, "output": render(None, skel, preds)})
+        torch_rows.append({"input": src, "output": render(None, skel, preds)})
         if i < CALIB_ROWS:
             calib_inputs.append(ids_cpu)
             calib_preds.append(preds.detach().cpu())
         if (i + 1) % 100 == 0:
-            log(f"reference decode {i + 1}/{len(slice_rows)} "
+            log(f"torch decode {i + 1}/{len(slice_rows)} "
                 f"({time.time() - t0:.0f}s)")
-    ref_path = RC / "reference-torch-fp32.jsonl"
-    ref_path.write_text(
-        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ref_rows),
+    torch_path = RC / "reference-torch-bf16.jsonl"
+    torch_path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in torch_rows),
         encoding="utf-8")
-    log(f"reference decode done ({time.time() - t0:.0f}s)")
+    log(f"torch decode done ({time.time() - t0:.0f}s)")
 
     # ---- 2. fp32 ONNX export ----
     plane_onnx = PlaneOnnx(encoder.cpu(), plane_emb.cpu(), head.cpu()).eval()
@@ -288,29 +288,68 @@ def main() -> None:
                     "plane_ids": _smoke_plane.numpy()})
     log("ort smoke row decoded OK")
 
-    cand_rows = []
-    t_onnx = time.time()
-    for i, row in enumerate(slice_rows):
-        skel, _ = NP.split_planes(row["src"])
-        ids = torch.tensor([encode_ids(skel)], dtype=torch.long)
-        plane = torch.full_like(ids, MASK_ID)
-        preds = None
-        for _ in range(K_PASSES):
-            logits = sess.run(None, {"input_ids": ids.numpy(),
-                                     "plane_ids": plane.numpy()})[0]
-            preds = torch.from_numpy(logits).argmax(-1)
-            plane = preds
-        cand_rows.append({"input": row["src"], "output": render(None, skel, preds)})
-        if (i + 1) % 100 == 0:
-            log(f"ort decode {i + 1}/{len(slice_rows)} ({time.time() - t_onnx:.0f}s)")
+    # ---- 4b. THE reference: the fp32 ONNX artifact decoded under ORT ----
+    # (the published round's definition: the shipped fp32 zip is the
+    # parity reference; the torch bf16-autocast decode is a sanity lane —
+    # autocast noise is NOT the reference)
+    from rababa.evaluate import seq2seq_der
 
-    # ---- 5. parity gates ----
+    fp32_sess = ort.InferenceSession(str(fp32_path), so,
+                                     providers=["CPUExecutionProvider"])
+
+    def ort_decode(session, rows):
+        out_rows = []
+        for i, row in enumerate(rows):
+            skel, _ = NP.split_planes(row["src"])
+            ids = torch.tensor([encode_ids(skel)], dtype=torch.long)
+            plane = torch.full_like(ids, MASK_ID)
+            preds = None
+            for _ in range(K_PASSES):
+                logits = session.run(None, {"input_ids": ids.numpy(),
+                                            "plane_ids": plane.numpy()})[0]
+                preds = torch.from_numpy(logits).argmax(-1)
+                plane = preds
+            out_rows.append({"input": row["src"],
+                             "output": render(None, skel, preds)})
+            if (i + 1) % 100 == 0:
+                log(f"ort decode {i + 1}/{len(rows)} "
+                    f"({time.time() - t_onnx:.0f}s)")
+        return out_rows
+
+    t_onnx = time.time()
+    ref_rows = ort_decode(fp32_sess, slice_rows)
+    ref_path = RC / "reference-fp32-onnx.jsonl"
+    ref_path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ref_rows),
+        encoding="utf-8")
+    sanity_flips = sum(1 for a, b in zip(ref_rows, torch_rows)
+                       if a["output"] != b["output"])
+    log(f"fp32 reference decode done ({time.time() - t_onnx:.0f}s); "
+        f"sanity fp32onnx-vs-torch flips={sanity_flips}/{len(ref_rows)}")
+
+    # ---- 5. candidate: the int8static artifact under ORT ----
+    cand_rows = ort_decode(sess, slice_rows)
+
+    # ---- 6. parity gates (int8static vs the fp32 ONNX reference) ----
     deltas = [cer(c["output"], r["output"]) for c, r in zip(cand_rows, ref_rows)]
     flips = sum(1 for c, r in zip(cand_rows, ref_rows) if c["output"] != r["output"])
     mean_delta_pp = 100.0 * sum(deltas) / len(deltas)
     max_delta_pp = 100.0 * max(deltas)
     flip_rate = flips / len(cand_rows)
     parity_pass = mean_delta_pp <= CER_GATE_PP and flip_rate <= FLIP_GATE
+
+    # informational: slice DER vs gold for fp32 / int8static / torch-bf16
+    def slice_der(rows):
+        wrong, total = 0.0, 0
+        for row, out in zip(slice_rows, rows):
+            d, n = seq2seq_der(out["output"], row["tgt"].strip())
+            wrong += d * n
+            total += n
+        return 100.0 * wrong / max(1, total)
+
+    der_fp32 = slice_der(ref_rows)
+    der_int8 = slice_der(cand_rows)
+    der_torch = slice_der(torch_rows)
     report = {
         "lane": "WO92 run-094 ship-gate (heb plane int8static RC)",
         "init": INIT_RUN,
@@ -327,14 +366,28 @@ def main() -> None:
             "gates": {"cer_delta_pp_max": CER_GATE_PP, "flip_rate_max": FLIP_GATE},
             "pass": parity_pass,
         },
-        "reference": "torch fp32 CUDA bf16-autocast (run-094 best; itself "
-                     "verdict-gated at DER 6.6078 on the full 1,864-row set)",
+        "reference": "the fp32 ONNX artifact decoded under ORT CPU (the "
+                     "published round's definition); torch bf16-autocast "
+                     "decode is a sanity lane only",
+        "sanity": {
+            "fp32onnx_vs_torch_flips": sanity_flips,
+            "note": "autocast noise indicator, not a gate",
+        },
+        "informational_slice_der_pp": {
+            "fp32_onnx": round(der_fp32, 4),
+            "int8static": round(der_int8, 4),
+            "torch_bf16": round(der_torch, 4),
+            "note": "seq2seq_der vs gold on the 600-row slice; the full-set "
+                    "verdict is 6.6078 (run-094 verdict.json)",
+        },
         "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     (RC / "parity-report.json").write_text(json.dumps(report, indent=1),
                                            encoding="utf-8")
     log(f"parity: mean_delta={mean_delta_pp:.4f}pp max={max_delta_pp:.4f}pp "
         f"flips={flips}/{len(cand_rows)} pass={parity_pass}")
+    log(f"slice DER pp: fp32={der_fp32:.4f} int8={der_int8:.4f} "
+        f"torch={der_torch:.4f}")
 
     # ---- 6. candidate zip + golden + SHA256SUMS ----
     classes_bytes = json.dumps(classes, ensure_ascii=False, indent=1).encode("utf-8")
@@ -382,7 +435,8 @@ def main() -> None:
         f"{sha256_file(int8_path)}  plane-int8static.onnx",
         f"{sha256_file(zip_path)}  {zip_path.name}",
         f"{sha256_file(golden_path)}  {golden_path.name}",
-        f"{sha256_file(ref_path)}  reference-torch-fp32.jsonl",
+        f"{sha256_file(ref_path)}  reference-fp32-onnx.jsonl",
+        f"{sha256_file(torch_path)}  reference-torch-bf16.jsonl",
         f"{hashlib.sha256((RC / 'parity-report.json').read_bytes()).hexdigest()}  parity-report.json",
     ]
     (RC / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
