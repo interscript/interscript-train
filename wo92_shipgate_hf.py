@@ -173,8 +173,9 @@ def main() -> None:
     plane_emb.load_state_dict(sd["plane_emb"])
     head.load_state_dict(sd["head"])
 
-    def torch_predict(ids: list[int]) -> torch.Tensor:
-        t = torch.tensor([ids], device="cuda")
+    def torch_predict(ids) -> torch.Tensor:
+        # accepts a cpu long tensor of shape [1, seq] or a flat id list
+        t = ids.to("cuda") if isinstance(ids, torch.Tensor) else torch.tensor([ids], device="cuda")
         am = torch.ones_like(t)
         plane = torch.full_like(t, MASK_ID)
         preds = None
@@ -195,7 +196,7 @@ def main() -> None:
         src = row["src"]
         skel, _ = NP.split_planes(src)
         ids_cpu = torch.tensor([encode_ids(skel)], dtype=torch.long)
-        preds = torch_predict(ids_cpu.tolist())
+        preds = torch_predict(ids_cpu)
         ref_rows.append({"input": src, "output": render(None, skel, preds)})
         if i < CALIB_ROWS:
             calib_inputs.append(ids_cpu)
