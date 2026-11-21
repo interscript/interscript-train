@@ -213,19 +213,23 @@ def main() -> None:
     # ---- 2. fp32 ONNX export ----
     plane_onnx = PlaneOnnx(encoder.cpu(), plane_emb.cpu(), head.cpu()).eval()
     fp32_path = RC / "plane-fp32.onnx"
-    dummy_ids = torch.ones((1, 16), dtype=torch.long)
+    # crown export invocation replicated exactly (export_plane_onnx_hf.py):
+    # no_grad around tracing, zeros dummy at seq 64, MASK plane ids — the
+    # T5 relative-attention-bias Gather mis-traces without these
+    dummy_ids = torch.zeros((1, 64), dtype=torch.long)
     dummy_plane = torch.full_like(dummy_ids, MASK_ID)
-    torch.onnx.export(
-        plane_onnx,
-        (dummy_ids, dummy_plane),
-        str(fp32_path),
-        input_names=["input_ids", "plane_ids"],
-        output_names=["class_logits"],
-        dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
-                      "plane_ids": {0: "batch", 1: "seq"},
-                      "class_logits": {0: "batch", 1: "seq"}},
-        opset_version=17, dynamo=False,
-    )
+    with torch.no_grad():
+        torch.onnx.export(
+            plane_onnx,
+            (dummy_ids, dummy_plane),
+            str(fp32_path),
+            input_names=["input_ids", "plane_ids"],
+            output_names=["class_logits"],
+            dynamic_axes={"input_ids": {0: "batch", 1: "seq"},
+                          "plane_ids": {0: "batch", 1: "seq"},
+                          "class_logits": {0: "batch", 1: "seq"}},
+            opset_version=17, dynamo=False,
+        )
     log(f"fp32 onnx {fp32_path.stat().st_size / 1e6:.1f} MB")
 
     # ---- 3. int8 static quantization (calibration with realistic plane_ids) ----
