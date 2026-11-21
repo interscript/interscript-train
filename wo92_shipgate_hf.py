@@ -196,7 +196,7 @@ def main() -> None:
         ref_rows.append({"input": src, "output": render(None, skel, preds)})
         if (i + 1) % 100 == 0:
             log(f"reference decode {i + 1}/{len(slice_rows)} "
-                f"({time.time() - t0:.0f}s)", flush=True)
+                f"({time.time() - t0:.0f}s)")
     ref_path = RC / "reference-torch-fp32.jsonl"
     ref_path.write_text(
         "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in ref_rows),
@@ -284,8 +284,7 @@ def main() -> None:
             plane = preds
         cand_rows.append({"input": row["src"], "output": render(None, skel, preds)})
         if (i + 1) % 100 == 0:
-            log(f"ort decode {i + 1}/{len(slice_rows)} ({time.time() - t_onnx:.0f}s)",
-                flush=True)
+            log(f"ort decode {i + 1}/{len(slice_rows)} ({time.time() - t_onnx:.0f}s)")
 
     # ---- 5. parity gates ----
     deltas = [cer(c["output"], r["output"]) for c, r in zip(cand_rows, ref_rows)]
