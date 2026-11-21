@@ -189,11 +189,17 @@ def main() -> None:
 
     slice_rows = load_slice()
     ref_rows = []
+    calib_inputs: list[torch.Tensor] = []   # real encoded ids (cpu)
+    calib_preds: list[torch.Tensor] = []    # reference predictions (cpu)
     for i, row in enumerate(slice_rows):
         src = row["src"]
         skel, _ = NP.split_planes(src)
-        preds = torch_predict(encode_ids(skel))
+        ids_cpu = torch.tensor([encode_ids(skel)], dtype=torch.long)
+        preds = torch_predict(ids_cpu.tolist())
         ref_rows.append({"input": src, "output": render(None, skel, preds)})
+        if i < CALIB_ROWS:
+            calib_inputs.append(ids_cpu)
+            calib_preds.append(preds.detach().cpu())
         if (i + 1) % 100 == 0:
             log(f"reference decode {i + 1}/{len(slice_rows)} "
                 f"({time.time() - t0:.0f}s)")
@@ -224,31 +230,25 @@ def main() -> None:
     # ---- 3. int8 static quantization (calibration with realistic plane_ids) ----
     from onnxruntime.quantization import CalibrationDataReader, QuantFormat, QuantType, quantize_static
 
-    calib_rows = slice_rows[:CALIB_ROWS]
-    calib_planes: list = []
-    for row in calib_rows:
-        skel, _ = NP.split_planes(row["src"])
-        ids = encode_ids(skel)
-        preds = torch_predict(ids).cpu()
-        calib_planes.append(preds)
-    # mix MASK rows (decode pass 1) with reference-prediction rows (passes 2-3)
-    calib_items = []
-    for preds in calib_planes:
-        calib_items.append(preds)
-    for preds in calib_planes[::2]:
-        calib_items.append(torch.full_like(preds, MASK_ID))
+    # calibration rows: reference predictions (passes 2..K) + MASK rows
+    # (pass 1), captured during the reference decode — no GPU work after
+    # the modules move to CPU for export.
+    calib_preds_all = list(calib_preds)
+    calib_inputs_all = list(calib_inputs)
+    for j in range(0, len(calib_preds), 2):
+        calib_preds_all.append(torch.full_like(calib_preds[j], MASK_ID))
+        calib_inputs_all.append(calib_inputs[j])
+    log(f"calibration rows: {len(calib_preds_all)} "
+        f"(predictions + MASK mix from the first {len(calib_preds)} slice rows)")
 
     class PlaneCalibReader(CalibrationDataReader):
         def __init__(self):
-            self._items = iter(calib_items)
+            self._iter = iter(zip(calib_inputs_all, calib_preds_all))
 
         def get_next(self):
-            try:
-                preds = next(self._items)
-            except StopIteration:
-                return None
-            ids = torch.ones_like(preds)
-            return {"input_ids": ids.numpy(), "plane_ids": preds.numpy()}
+            for ids, preds in self._iter:
+                return {"input_ids": ids.numpy(), "plane_ids": preds.numpy()}
+            return None
 
     int8_path = RC / "plane-int8static.onnx"
     quantize_static(
@@ -259,7 +259,7 @@ def main() -> None:
         weight_type=QuantType.QInt8,
     )
     log(f"int8static onnx {int8_path.stat().st_size / 1e6:.1f} MB "
-        f"({len(calib_items)} calibration rows)")
+        f"({len(calib_preds_all)} calibration rows)")
 
     # ---- 4. ORT CPU (x86) decode of the candidate ----
     import onnxruntime as ort
