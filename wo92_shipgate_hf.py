@@ -448,9 +448,136 @@ def main() -> None:
                "zip": zip_path.name,
                "zip_bytes": zip_path.stat().st_size,
                "elapsed_s": round(time.time() - t0)}
-    (RC / "SHIPGATE_DONE").write_text(json.dumps(summary, indent=1) + "\n",
+    log("summary_static " + json.dumps(summary))
+
+    # ---- 7. second arm: int8 DYNAMIC — the crown lineage's shipped mode ----
+    # The static lever's verdict scope was KV-only (WO20u); the plane
+    # encoder measures it NEGATIVE above. The crown shipped int8 dynamic
+    # (quantize_dynamic QInt8), so the successor matrix needs that arm
+    # measured under the same gates before any owner decision.
+    from onnxruntime.quantization import quantize_dynamic
+
+    dyn_path = RC / "plane-int8dynamic.onnx"
+    quantize_dynamic(str(fp32_path), str(dyn_path), weight_type=QuantType.QInt8)
+    log(f"int8dynamic onnx {dyn_path.stat().st_size / 1e6:.1f} MB")
+    dyn_sess = ort.InferenceSession(str(dyn_path), so,
+                                    providers=["CPUExecutionProvider"])
+    dyn_sess.run(None, {"input_ids": _smoke_ids.numpy(),
+                        "plane_ids": _smoke_plane.numpy()})
+    log("ort dynamic smoke row decoded OK")
+    dyn_rows = ort_decode(dyn_sess, slice_rows)
+
+    dyn_deltas = [cer(c["output"], r["output"]) for c, r in zip(dyn_rows, ref_rows)]
+    dyn_flips = sum(1 for c, r in zip(dyn_rows, ref_rows) if c["output"] != r["output"])
+    dyn_mean_pp = 100.0 * sum(dyn_deltas) / len(dyn_deltas)
+    dyn_max_pp = 100.0 * max(dyn_deltas)
+    dyn_flip_rate = dyn_flips / len(dyn_rows)
+    dyn_pass = dyn_mean_pp <= CER_GATE_PP and dyn_flip_rate <= FLIP_GATE
+    der_dyn = slice_der(dyn_rows)
+    dyn_report = {
+        "lane": "WO92 run-094 ship-gate (heb plane int8-DYNAMIC arm)",
+        "init": INIT_RUN,
+        "slice": {"file": "conformance/wo20/eval600/heb_eval_600.jsonl",
+                  "rows": len(slice_rows), "sha256": SLICE_SHA},
+        "decode_mode": "single-row greedy K=3 (shipped)",
+        "ort_providers": dyn_sess.get_providers(),
+        "parity": {
+            "mean_cer_delta_pp": round(dyn_mean_pp, 4),
+            "max_cer_delta_pp": round(dyn_max_pp, 4),
+            "flips": dyn_flips,
+            "flip_rate": round(dyn_flip_rate, 6),
+            "samples": len(dyn_rows),
+            "gates": {"cer_delta_pp_max": CER_GATE_PP, "flip_rate_max": FLIP_GATE},
+            "pass": dyn_pass,
+        },
+        "reference": "the fp32 ONNX artifact decoded under ORT CPU (the "
+                     "published round's definition)",
+        "informational_slice_der_pp": {
+            "fp32_onnx": round(der_fp32, 4),
+            "int8dynamic": round(der_dyn, 4),
+            "note": "seq2seq_der vs gold on the 600-row slice",
+        },
+        "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    dyn_report_path = RC / "parity-report-int8dynamic.json"
+    dyn_report_path.write_text(json.dumps(dyn_report, indent=1), encoding="utf-8")
+    log(f"parity_dynamic: mean_delta={dyn_mean_pp:.4f}pp max={dyn_max_pp:.4f}pp "
+        f"flips={dyn_flips}/{len(dyn_rows)} pass={dyn_pass}")
+    log(f"slice DER pp (dynamic arm): int8dynamic={der_dyn:.4f}")
+
+    # dynamic zip (crown zip layout; precision + parity from this arm)
+    onnx_dyn_bytes = dyn_path.read_bytes()
+    dyn_meta = (
+        "id: heb-vocalized-plane-wo92rc  # RC lane id; final heb-vocalized-plane-{major.minor} = owner decision\n"
+        "task: diacritization\n"
+        "target: Hebr\n"
+        "kind: plane\n"
+        "precision: int8-dynamic\n"
+        "k_passes: 3\n"
+        "decode: single-row-greedy\n"
+        "license: BSD-3-Clause\n"
+        "trained_from: interscript-train train_hebrew_sft_hf.py (WO92 stage-2 gold SFT)\n"
+        "  on run-093-heb-weak-pretrain best (knesset-v6 deduped weak-pretrain + gold);\n"
+        "  checkpoint isx-training:/run-094-heb-gold-sft/best/model.pt\n"
+        "metrics:\n"
+        "- name: der_total_greedy\n"
+        "  value: 6.6078\n"
+        "  protocol: crown protocol (greedy K=3, seq2seq_der), Nakdimon test 1,864 rows\n"
+        "  source: isx-training:/run-094-heb-gold-sft/verdict.json\n"
+        "parity:\n"
+        f"  samples: {len(dyn_rows)}\n"
+        f"  cer_delta: {round(dyn_mean_pp, 4)}\n"
+        f"  flip_rate: {round(dyn_flip_rate, 6)}\n"
+        "sha256:\n"
+        f"  plane-int8dynamic.onnx: {hashlib.sha256(onnx_dyn_bytes).hexdigest()}\n"
+        f"  classes.json: {hashlib.sha256(classes_bytes).hexdigest()}\n"
+    )
+    dyn_zip_buf = __import__("io").BytesIO()
+    with zipfile.ZipFile(dyn_zip_buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("metadata.yaml", dyn_meta)
+        zf.writestr("classes.json", classes_bytes)
+        zf.writestr("plane-int8dynamic.onnx", onnx_dyn_bytes)
+    dyn_zip_path = RC / "heb-vocalized-plane-wo92rc-int8dynamic.zip"
+    dyn_zip_path.write_bytes(dyn_zip_buf.getvalue())
+
+    dyn_golden_path = RC / "heb-vocalized-plane-wo92rc-int8dynamic-golden.jsonl"
+    dyn_golden_path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in dyn_rows),
+        encoding="utf-8")
+
+    sums = [
+        f"{sha256_file(fp32_path)}  plane-fp32.onnx",
+        f"{sha256_file(int8_path)}  plane-int8static.onnx",
+        f"{sha256_file(zip_path)}  {zip_path.name}",
+        f"{sha256_file(golden_path)}  {golden_path.name}",
+        f"{sha256_file(dyn_path)}  plane-int8dynamic.onnx",
+        f"{sha256_file(dyn_zip_path)}  {dyn_zip_path.name}",
+        f"{sha256_file(dyn_golden_path)}  {dyn_golden_path.name}",
+        f"{sha256_file(torch_path)}  reference-torch-bf16.jsonl",
+        f"{sha256_file(ref_path)}  reference-fp32-onnx.jsonl",
+        f"{hashlib.sha256((RC / 'parity-report.json').read_bytes()).hexdigest()}  parity-report.json",
+        f"{hashlib.sha256(dyn_report_path.read_bytes()).hexdigest()}  parity-report-int8dynamic.json",
+    ]
+    (RC / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
+
+    final = {
+        "static": {"parity_pass": parity_pass,
+                   "mean_cer_delta_pp": round(mean_delta_pp, 4),
+                   "flip_rate": round(flip_rate, 6),
+                   "slice_der_pp": round(der_int8, 4),
+                   "zip": zip_path.name, "zip_bytes": zip_path.stat().st_size},
+        "dynamic": {"parity_pass": dyn_pass,
+                    "mean_cer_delta_pp": round(dyn_mean_pp, 4),
+                    "flip_rate": round(dyn_flip_rate, 6),
+                    "slice_der_pp": round(der_dyn, 4),
+                    "zip": dyn_zip_path.name, "zip_bytes": dyn_zip_path.stat().st_size},
+        "reference_slice_der_pp": round(der_fp32, 4),
+        "samples": len(slice_rows),
+        "elapsed_s": round(time.time() - t0),
+    }
+    (RC / "SHIPGATE_DONE").write_text(json.dumps(final, indent=1) + "\n",
                                       encoding="utf-8")
-    log("summary " + json.dumps(summary))
+    log("summary " + json.dumps(final))
 
 
 if __name__ == "__main__":
