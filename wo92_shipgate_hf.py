@@ -260,8 +260,12 @@ def main() -> None:
         str(fp32_path), str(int8_path),
         calibration_data_reader=PlaneCalibReader(),
         quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QInt8,
+        activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
+        # the house static recipe (run-070 ara large static): quantize the
+        # compute MatMuls/Gemms ONLY — quantizing the T5 relative-attention
+        # bias subgraph corrupts its int64 bucket indices at runtime
+        op_types_to_quantize=["MatMul", "Gemm"],
     )
     log(f"int8static onnx {int8_path.stat().st_size / 1e6:.1f} MB "
         f"({len(calib_preds_all)} calibration rows)")
@@ -274,6 +278,15 @@ def main() -> None:
     sess = ort.InferenceSession(str(int8_path), so,
                                 providers=["CPUExecutionProvider"])
     log("ort providers: " + str(sess.get_providers()))
+
+    # smoke: row 0 must decode before the 600-row loop (fail fast with a
+    # clear signal instead of a mid-loop ORT crash)
+    _smoke_skel, _ = NP.split_planes(slice_rows[0]["src"])
+    _smoke_ids = torch.tensor([encode_ids(_smoke_skel)], dtype=torch.long)
+    _smoke_plane = torch.full_like(_smoke_ids, MASK_ID)
+    sess.run(None, {"input_ids": _smoke_ids.numpy(),
+                    "plane_ids": _smoke_plane.numpy()})
+    log("ort smoke row decoded OK")
 
     cand_rows = []
     t_onnx = time.time()
