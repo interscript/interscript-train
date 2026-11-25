@@ -243,18 +243,54 @@ def main() -> None:
     log(f"[data] ganjoor={len(ganjoor_train)} ganjoor_val={len(ganjoor_val)} "
         f"docs={len(docs_train)} docs_test={len(docs_test)} "
         f"poetry_eval={len(poetry_eval)}")
+    # ---- eval-exclusion (the pre-registered holdout law, ENFORCED) ----
+    # Any curriculum row whose src/tgt (whitespace-stripped) exactly
+    # matches a pinned-eval source/target — or a docs-test source/target —
+    # is DROPPED and recorded to dropped-rows.jsonl. The run-099 first
+    # attempt aborted here: 5 curriculum rows match pinned poetry eval
+    # sources (the register corpus predates the eval pin; the
+    # acquisition-time decontam covered only the acquired sources).
+    eval_srcs = {s.strip() for s, _ in poetry_eval}
+    eval_tgts = {t.strip() for _, t in poetry_eval}
+    test_srcs = {s.strip() for s, _ in docs_test}
+    test_tgts = {t.strip() for _, t in docs_test}
+
+    def _exclude(pairs: list[tuple[str, str]], side: str):
+        kept, dropped = [], []
+        for s, t in pairs:
+            if (s.strip() in eval_srcs or t.strip() in eval_tgts
+                    or s.strip() in test_srcs or t.strip() in test_tgts):
+                dropped.append({"side": side,
+                                "src_sha16": hashlib.sha256(
+                                    s.encode()).hexdigest()[:16],
+                                "tgt_sha16": hashlib.sha256(
+                                    t.encode()).hexdigest()[:16]})
+                continue
+            kept.append((s, t))
+        return kept, dropped
+
+    ganjoor_train, drop_g = _exclude(ganjoor_train, "ganjoor")
+    docs_train, drop_d = _exclude(docs_train, "docs")
+    dropped = drop_g + drop_d
+    if dropped:
+        with (OUT / "dropped-rows.jsonl").open("w", encoding="utf-8") as f:
+            for d in dropped:
+                f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    log(f"[holdout] dropped {len(drop_g)} ganjoor + {len(drop_d)} docs rows "
+        f"matching pinned eval/test content (recorded in dropped-rows.jsonl)")
+
     curriculum = docs_train + ganjoor_train
     random.Random(42).shuffle(curriculum)
     log(f"[curriculum] combined={len(curriculum)} "
         f"(ganjoor share {len(ganjoor_train) / len(curriculum):.3f})")
 
-    # ---- eval eval-pins: the pinned evals must not leak into training ----
-    eval_srcs = {s for s, _ in poetry_eval}
-    leaked = sum(1 for s, _ in curriculum if s in eval_srcs)
-    if leaked:
-        raise SystemExit(f"EVAL LEAK: {leaked} curriculum rows match the "
-                         "pinned poetry eval — training aborted")
-    log(f"[decontam-check] 0 curriculum rows match the pinned eval sources")
+    # ---- holdout assertion: zero residual overlap (hard property) ----
+    residual = sum(1 for s, t in curriculum
+                   if s.strip() in eval_srcs or t.strip() in eval_tgts)
+    if residual:
+        raise SystemExit(f"EVAL LEAK persists: {residual} rows remain — "
+                         "training aborted")
+    log("[holdout] 0 curriculum rows overlap the pinned evals")
 
     from transformers import (AutoModelForSeq2SeqLM, AutoTokenizer,
                               get_cosine_schedule_with_warmup)
