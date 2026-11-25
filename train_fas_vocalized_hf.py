@@ -81,6 +81,25 @@ GANJOOR = CKPT / "run-098-fas-acquisition/ganjoor-vocalized"
 DOCS = CKPT / "run-076-fas-diac-retrain"
 POETRY_EVAL = CKPT / "run-089-fas-poetry-eval/fas-poetry-eval.jsonl"
 BACKBONE = os.environ.get("FAS_BACKBONE", "google/byt5-base")
+
+# ---- run-100 proportion-iteration knobs (disposition 2, relayed) ----
+# FAS_GANJOOR_SHARE: the curriculum's ganjoor share target. 1.0 (default)
+# = the full post-exclusion ganjoor pool (run-099 behavior). For run-100
+# = 0.15: the docs side stays COMPLETE (the register anchor is never
+# subsampled) and ganjoor is CAPPED to floor(len(docs) * share/(1-share))
+# via a seed-42 sample over the SAME post-exclusion pool — derivation
+# (docs 436,599 post-exclusion): ganjoor = floor(436,599 x 0.15/0.85) =
+# 77,046 -> combined 513,645, share 77,046/513,645 = 0.149994. Keeping
+# the exclusions identical makes PROPORTION the only experimental delta
+# vs run-099.
+# FAS_DOCS_CLEAN=1: the docs gate measures on the CLEAN instrument
+# (wo94-docs-instrument/docs-test-clean, 7,621 rows, sha 61f2b760…)
+# instead of the lineage-contaminated 9,288-row test. Threshold
+# unchanged (0.0070 row-mean); crown clean reference 0.6527%.
+GANJOOR_SHARE = float(os.environ.get("FAS_GANJOOR_SHARE", "1.0"))
+DOCS_CLEAN = os.environ.get("FAS_DOCS_CLEAN", "0") == "1"
+DOCS_CLEAN_JSONL = CKPT / "wo94-docs-instrument/docs-test-clean/docs-test-clean.jsonl"
+DOCS_CLEAN_JSONL_SHA = "61f2b760d5fc5b89569998cc8a2627588495cbdd00d1521d916d61bcc8341dc9"
 EPOCHS = int(os.environ.get("FAS_EPOCHS", "3"))
 BS = int(os.environ.get("FAS_BS", "16"))
 ACCUM = int(os.environ.get("FAS_ACCUM", "2"))
@@ -279,6 +298,15 @@ def main() -> None:
     log(f"[holdout] dropped {len(drop_g)} ganjoor + {len(drop_d)} docs rows "
         f"matching pinned eval/test content (recorded in dropped-rows.jsonl)")
 
+    # ---- proportion knob (run-100): cap ganjoor AFTER the exclusions ----
+    if GANJOOR_SHARE < 1.0:
+        k = min(len(ganjoor_train),
+                int(len(docs_train) * GANJOOR_SHARE / (1 - GANJOOR_SHARE)))
+        idx = sorted(random.Random(42).sample(range(len(ganjoor_train)), k))
+        ganjoor_train = [ganjoor_train[i] for i in idx]
+        log(f"[share] ganjoor subsampled (seed-42) to {k} rows "
+            f"(target share {GANJOOR_SHARE})")
+
     curriculum = docs_train + ganjoor_train
     random.Random(42).shuffle(curriculum)
     log(f"[curriculum] combined={len(curriculum)} "
@@ -381,14 +409,29 @@ def main() -> None:
     tok.save_pretrained(best)
     log("[eval] best checkpoint saved; running the pinned gates")
 
-    docs_res = evaluate(model, tok, docs_test, "docs")
+    # ---- docs gate: the CLEAN instrument (run-100) or the lineage test ----
+    if DOCS_CLEAN:
+        got = sha256_file(DOCS_CLEAN_JSONL)
+        if got != DOCS_CLEAN_JSONL_SHA:
+            raise SystemExit(f"PIN FAIL: clean instrument sha {got} != "
+                             f"{DOCS_CLEAN_JSONL_SHA}")
+        gate_rows = load_pairs(DOCS_CLEAN_JSONL)
+        gate_instrument = (f"wo94-docs-instrument/docs-test-clean "
+                           f"({len(gate_rows)} rows, sha {DOCS_CLEAN_JSONL_SHA[:16]}…)")
+        log(f"[gate] clean instrument rows={len(gate_rows)} (pin ok)")
+    else:
+        gate_rows = docs_test
+        gate_instrument = "run-076 docs test (9,288 rows, lineage-contaminated)"
+    docs_res = evaluate(model, tok, gate_rows, "docs")
     results["docs_gate"] = {**docs_res,
+                            "instrument": gate_instrument,
                             "gate_row_mean_max": DOCS_GATE,
                             "gate_pass": docs_res["cer_row_mean"] < DOCS_GATE}
     poetry_res = evaluate(model, tok, poetry_eval, "poetry")
     results["poetry_eval"] = {**poetry_res,
                               "baseline": 0.3367,
-                              "register_arm_precedent": 0.1655}
+                              "register_arm_precedent": 0.1655,
+                              "run_099_precedent": 0.151375}
     val_res = evaluate(model, tok, ganjoor_val[:5000], "ganjoor-val5k")
     results["ganjoor_val"] = val_res
 
